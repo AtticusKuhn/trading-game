@@ -1,0 +1,81 @@
+{
+  "nodes": {
+    "eff-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1686488455,
+        "narHash": "sha256-4wftxrJOjiY9eZ3Ia/yUGnVSJYqSxgSohhyCWnVQxuA=",
+        "owner": "lexi-lambda",
+        "repo": "eff",
+        "rev": "a6ad3c7d7c62d21cf088af109ceb1d10a56b7125",
+        "type": "github"
+      },
+      "original": {
+        "owner": "lexi-lambda",
+        "repo": "eff",
+        "rev": "a6ad3c7d7c62d21cf088af109ceb1d10a56b7125",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1788614874,
+        "narHash": "sha256-7QYjT2vHLuX9Z1pdxHXDKCbh1CR3D/2rywB9Tx0MPRg=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "c043004d1c6985732bcc1cbc5a9c9aecbbb4e0f0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "quickspec-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787839511,
+        "narHash": "sha256-SO5bAvU+715OT63F+VHRr9fSu/rfduB3b9nhQQ745B8=",
+        "owner": "nick8325",
+        "repo": "quickspec",
+        "rev": "94d67d3ca40cc57c2b96d7e176a74308049dbc8c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nick8325",
+        "repo": "quickspec",
+        "rev": "94d67d3ca40cc57c2b96d7e176a74308049dbc8c",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "eff-src": "eff-src",
+        "nixpkgs": "nixpkgs",
+        "quickspec-src": "quickspec-src",
+        "twee-src": "twee-src"
+      }
+    },
+    "twee-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1779632316,
+        "narHash": "sha256-Z7py2lxrZpM8v5tNFrDixO+ncp85GmthcEYioqTSxI4=",
+        "owner": "nick8325",
+        "repo": "twee",
+        "rev": "9f56b26a9b09ea508ff944702b88d60db48c4cb9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nick8325",
+        "repo": "twee",
+        "rev": "9f56b26a9b09ea508ff944702b88d60db48c4cb9",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
