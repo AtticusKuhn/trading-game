@@ -10,7 +10,7 @@ import Test.QuickCheck
 import TradingGame
 import TestSupport
 import EngineTests (engineProperties, discoverLaws)
-import LiveTests (liveProperties, runLiveTests)
+import LiveTests (liveProperties)
 
 -- Eff programs have no Show instance. Print the secrets and resulting
 -- settlements on failure; QuickCheck's replay seed reproduces the programs.
@@ -75,6 +75,5 @@ main = do
     , prop_samePriceLeavesOnlyOneSide
     , prop_explicitPlayerIds
     ] ++ engineProperties ++ liveProperties)
-  livePassed <- runLiveTests
   discoverLaws
-  unless (all isSuccess results && livePassed) exitFailure
+  unless (all isSuccess results) exitFailure

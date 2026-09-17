@@ -1,22 +1,72 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module LiveTests (liveProperties, runLiveTests) where
+module LiveTests (liveProperties) where
 
 import qualified Control.Concurrent.Async as Async
+import Control.Concurrent (yield)
+import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (SomeException, displayException, throwIO, try)
-import Control.Monad (foldM, forM, unless, void)
-import Data.Time.Clock (UTCTime, addUTCTime)
-import System.Timeout (timeout)
-import Test.QuickCheck hiding (replay, label)
-import TestSupport
+import Control.Exception (SomeException, fromException, throw, throwIO, try)
+import Control.Monad (foldM, unless, void)
+import Data.Ratio ((%))
+import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
+import GHC.Conc (ThreadStatus(..), BlockReason(..), threadStatus)
+import Test.QuickCheck hiding (replay, total)
 import TradingGame
 
+-- Positive gaps preserve distinct IDs and ordered wakeups even while shrinking.
+data Scenario = Scenario
+  { identities :: (Integer, Positive Integer)
+  , secrets :: (Int, Int)
+  , startOffset :: Integer
+  , timeGaps :: (Positive Integer, Positive Integer, Positive Integer)
+  } deriving Show
+
+instance Arbitrary Scenario where
+  arbitrary = Scenario <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
+  shrink (Scenario ids numbers offset gaps) =
+    [Scenario ids' numbers' offset' gaps' |
+      (ids', numbers', offset', gaps') <- shrink (ids, numbers, offset, gaps)]
+
+scenarioPlayers :: Scenario -> ((PlayerId, Int), (PlayerId, Int))
+scenarioPlayers scenario =
+  let (identifier, Positive gap) = identities scenario
+      (firstSecret, secondSecret) = secrets scenario
+  in ((PlayerId identifier, firstSecret), (PlayerId (identifier + gap), secondSecret))
+
+scenarioStart :: Scenario -> UTCTime
+scenarioStart scenario = addUTCTime (fromInteger (startOffset scenario)) simulationStart
+
+-- First wakeup, second wakeup, closure; all strictly separated.
+scenarioTimes :: Scenario -> (NominalDiffTime, NominalDiffTime, NominalDiffTime)
+scenarioTimes scenario =
+  let (Positive first, Positive second, Positive third) = timeGaps scenario
+  in (fromInteger first, fromInteger (first + second), fromInteger (first + second + third))
+
+scenarioEngine :: Scenario -> Engine
+scenarioEngine scenario =
+  let ((first, firstSecret), (second, secondSecret)) = scenarioPlayers scenario
+      (_, _, duration) = scenarioTimes scenario
+  in newEngine (scenarioStart scenario) duration
+       [(first, toInteger firstSecret), (second, toInteger secondSecret)]
+
+-- Generate valid orders, including negative/fractional prices, with shrinking.
+newtype ValidOrder = ValidOrder (Bool, Integer, Positive Integer, Positive Integer)
+  deriving Show
+
+instance Arbitrary ValidOrder where
+  arbitrary = ValidOrder <$> arbitrary
+  shrink (ValidOrder values) = map ValidOrder (shrink values)
+
+validOrder :: ValidOrder -> LimitOrder
+validOrder (ValidOrder (buy, numerator, Positive denominator, Positive quantity)) =
+  LimitOrder (if buy then Buy else Sell) (Price (numerator % denominator)) quantity
+
 -- No real sleeps: advancing one TVar changes both clock reads and all alarms.
-manualClock :: IO (LiveClock, UTCTime -> IO ())
-manualClock = do
-  time <- newTVarIO simulationStart
+manualClock :: UTCTime -> IO (LiveClock, UTCTime -> IO ())
+manualClock start = do
+  time <- newTVarIO start
   let clock = LiveClock
         (readTVarIO time)
         (\target -> pure (readTVar time >>= check . (>= target)))
@@ -32,9 +82,10 @@ record events event = atomically (modifyTVar' events (event :))
 awaitTrace :: TVar [LiveEvent] -> ([LiveEvent] -> Bool) -> IO ()
 awaitTrace events predicate = atomically (readTVar events >>= check . predicate)
 
-assertEqual :: (Eq a, Show a) => String -> a -> a -> IO ()
-assertEqual label expected actual = unless (expected == actual) $
-  ioError (userError (label ++ ": expected " ++ show expected ++ ", got " ++ show actual))
+-- Inputs are generated outside IO, so shrinking recreates the whole runtime.
+-- This fixed timeout is a deadlock guard, never a way to order concurrent actions.
+liveProperty :: String -> IO Property -> Property
+liveProperty name action = counterexample name $ within 5000000 $ ioProperty action
 
 -- Matching on the GADT recovers the Eq dictionary for each response type.
 sameDecision :: TradingGame m a -> Decision a -> Decision a -> Bool
@@ -56,39 +107,58 @@ replay = foldM step
          else Left ("response mismatch at " ++ show now ++ " for " ++ show pid)
 
 liveProperties :: [Property]
-liveProperties = [prop_liveReplay]
+liveProperties =
+  [ property prop_liveReplay
+  , property prop_concurrentPlayers
+  , property prop_stopsAtClosure
+  , property prop_concurrentOrders
+  , property prop_settlementBroadcast
+  , property prop_deadlineUnderContention
+  , property prop_lockRecovery
+  , property (prop_playerFailure False)
+  , property (prop_playerFailure True)
+  , property prop_exchangeFailureSupervision
+  , prop_realClock
+  ]
 
--- Exercise real STM transport and compare its observed responses and final
--- state with pure replay. Ordering here is controlled; the player test below
--- also replays a trace produced by concurrent, time-dependent programs.
-prop_liveReplay :: Property
-prop_liveReplay = forAll (listOf ((,) <$> elements [PlayerId 1, PlayerId 2] <*> genOrder)) $ \orders ->
-  ioProperty $ do
-    result <- timeout 5000000 $ do
-      (clock, advance) <- manualClock
-      runtime <- newLiveRuntime 1
-      events <- newTVarIO []
-      Async.withAsync (runExchange clock (record events) runtime fixture) $ \server -> do
-        private <- requestLive runtime (PlayerId 1) GetMyPrivateNumber
-        assertEqual "private number" (Right (Reply 3)) private
-        model <- foldM (\engine (index :: Integer, (pid, order)) -> do
-          -- Several processing times, all strictly before the deadline.
-          let now = addUTCTime (fromRational (toRational index / toRational (length orders + 1))) simulationStart
-              (updated, expected) = handleRequest now pid (SubmitOrder order) engine
-          advance now
-          requestLive runtime pid (SubmitOrder order) >>= assertEqual "order reply" (Right expected)
-          requestLive runtime pid GetExchangeState >>=
-            assertEqual "snapshot reply" (Right (snd (handleRequest now pid GetExchangeState updated)))
-          pure updated) fixture (zip [0..] orders)
-        now <- clockNow clock
-        requestLive runtime (PlayerId 1) (Wait (-1)) >>= assertEqual "negative wait" (Right (ResumeAt now))
-        requestLive runtime (PlayerId 2) (WaitUntil simulationStart) >>= assertEqual "past wait" (Right (ResumeAt now))
-        advance (closesAt (engineInfo fixture))
-        final <- Async.wait server
-        trace <- reverse <$> readTVarIO events
-        assertEqual "model final state" (advanceTo (closesAt (engineInfo fixture)) model) final
-        pure (replay fixture trace == Right final)
-    pure (counterexample "live trace differed or runner timed out" (result == Just True))
+-- Compare direct live responses and final state with the pure engine.
+prop_liveReplay :: Scenario -> [(Bool, ValidOrder)] -> Positive Integer -> Property
+prop_liveReplay scenario orders (Positive past) = liveProperty "live replay" $ do
+  let initial = scenarioEngine scenario
+      start = scenarioStart scenario
+      ((first, firstSecret), (second, _)) = scenarioPlayers scenario
+      (_, _, duration) = scenarioTimes scenario
+  (clock, advance) <- manualClock start
+  events <- newTVarIO []
+  runtime <- newLiveRuntime clock (record events) initial
+  Async.withAsync (runExchange runtime) $ \server -> do
+    private <- requestLive runtime first GetMyPrivateNumber
+    (model, checks) <- foldM (\(engine, checks) (index :: Integer, (isFirst, generated)) -> do
+      -- Spread requests across the generated duration, strictly before closure.
+      let now = addUTCTime (duration * fromRational (index % toInteger (length orders + 1))) start
+          pid = if isFirst then first else second
+          order = validOrder generated
+          (updated, expected) = handleRequest now pid (SubmitOrder order) engine
+      advance now
+      reply <- requestLive runtime pid (SubmitOrder order)
+      snapshot <- requestLive runtime pid GetExchangeState
+      pure (updated, conjoin
+        [ counterexample "order reply" (reply === expected)
+        , counterexample "snapshot reply" (snapshot === snd (handleRequest now pid GetExchangeState updated))
+        ] : checks)) (initial, []) (zip [0..] orders)
+    now <- clockNow clock
+    negativeWait <- requestLive runtime first (Wait (negate (fromInteger past)))
+    pastWait <- requestLive runtime second (WaitUntil (addUTCTime (negate (fromInteger past)) start))
+    advance (closesAt (engineInfo initial))
+    final <- Async.wait server
+    trace <- reverse <$> readTVarIO events
+    pure $ conjoin (checks ++
+      [ private === Reply (toInteger firstSecret)
+      , negativeWait === ResumeAt now
+      , pastWait === ResumeAt now
+      , counterexample "model final state" (final === advanceTo (closesAt (engineInfo initial)) model)
+      , counterexample "trace replay" (replay initial trace === Right final)
+      ])
 
 hasWait :: PlayerId -> [LiveEvent] -> Bool
 hasWait pid = any $ \event -> case event of
@@ -100,175 +170,217 @@ hasSettlementWait pid = any $ \event -> case event of
   RequestHandled _ who AwaitSettlement WhenResolved -> who == pid
   _ -> False
 
-testConcurrentPlayers :: IO ()
-testConcurrentPlayers = do
-  (clock, advance) <- manualClock
+prop_concurrentPlayers :: Scenario -> ValidOrder -> Property
+prop_concurrentPlayers scenario generated = liveProperty "concurrent players, waits, settlement and replay" $ do
+  let start = scenarioStart scenario
+      ((buyerId, buyerSecret), (sellerId, sellerSecret)) = scenarioPlayers scenario
+      (sellerWake, buyerWake, duration) = scenarioTimes scenario
+      order = validOrder generated
+      Price price = limitPrice order
+      quantity = orderQuantity order
+      total = toInteger buyerSecret + toInteger sellerSecret
+      payoff = fromInteger quantity * (fromInteger total - price)
+  (clock, advance) <- manualClock start
   events <- newTVarIO []
   let buyer = do
         secret <- getMyPrivateNumber
-        unless (secret == 3) (error "wrong private number")
-        void (submitOrder (LimitOrder Buy (Price 5) 2))
-        wait 10
+        unless (secret == toInteger buyerSecret) (error "wrong private number")
+        void (submitOrder order { orderSide = Buy })
+        wait buyerWake
         snapshot <- getExchangeState
-        unless (tradeHistory snapshot == [Trade (Price 5) 2 (addUTCTime 5 simulationStart)]) $
+        unless (tradeHistory snapshot == [Trade (limitPrice order) quantity (addUTCTime sellerWake start)]) $
           error "sleeping buyer did not observe seller's fill"
         void awaitSettlement
       seller = do
-        wait 5
-        void (submitOrder (LimitOrder Sell (Price 5) 2))
+        wait sellerWake
+        void (submitOrder order { orderSide = Sell })
         void awaitSettlement
-      -- Deliberately reverse ID order to check the runner's result ordering.
-      players = [(PlayerId 2, seller, 7), (PlayerId 1, buyer, 3)]
-      initial = newEngine simulationStart 60 [(PlayerId 2, 7), (PlayerId 1, 3)]
-      config = defaultLiveConfig
-        { liveDuration = 60, liveQueueCapacity = 1, onLiveEvent = record events }
+      -- Reverse ID order to check that settlements follow the input order.
+      players = [(sellerId, seller, sellerSecret), (buyerId, buyer, buyerSecret)]
+      initial = newEngine start duration [(sellerId, toInteger sellerSecret), (buyerId, toInteger buyerSecret)]
+      config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
   Async.withAsync (runLiveEngineWith clock config players) $ \game -> do
-    awaitTrace events (\trace -> hasWait (PlayerId 1) trace && hasWait (PlayerId 2) trace)
-    advance (addUTCTime 5 simulationStart)
-    awaitTrace events (hasSettlementWait (PlayerId 2))
-    advance (addUTCTime 10 simulationStart)
-    awaitTrace events (hasSettlementWait (PlayerId 1))
-    advance (addUTCTime 60 simulationStart)
+    awaitTrace events (\trace -> hasWait buyerId trace && hasWait sellerId trace)
+    advance (addUTCTime sellerWake start)
+    awaitTrace events (hasSettlementWait sellerId)
+    advance (addUTCTime buyerWake start)
+    awaitTrace events (hasSettlementWait buyerId)
+    advance (addUTCTime duration start)
     final <- Async.wait game
-    assertEqual "settlements" [Settlement 10 (-10), Settlement 10 10] (engineSettlements final)
     trace <- reverse <$> readTVarIO events
-    assertEqual "concurrent trace replay" (Right final) (replay initial trace)
-    let settled = [pid | RequestHandled _ pid AwaitSettlement (Reply _) <- trace]
-    assertEqual "all parked replies completed" [PlayerId 2, PlayerId 1] settled
+    pure $ conjoin
+      [ engineSettlements final === [Settlement total (-payoff), Settlement total payoff]
+      , counterexample "concurrent trace replay" (replay initial trace === Right final)
+      , counterexample "one closure event" (length [() | ExchangeClosed _ <- trace] === 1)
+      ]
 
-testStopsAtClosure :: IO ()
-testStopsAtClosure = do
-  (clock, advance) <- manualClock
+prop_stopsAtClosure :: Scenario -> Positive Integer -> Property
+prop_stopsAtClosure scenario (Positive overrun) = liveProperty "idle closure and cancellation of long waits" $ do
+  let ((first, firstSecret), (second, secondSecret)) = scenarioPlayers scenario
+      start = scenarioStart scenario
+      (_, _, duration) = scenarioTimes scenario
+      total = toInteger firstSecret + toInteger secondSecret
+  (clock, advance) <- manualClock start
   events <- newTVarIO []
-  let sleeper = wait 120 >> error "live runner resumed a wait beyond closure"
-      config = defaultLiveConfig { liveDuration = 60, onLiveEvent = record events }
-  Async.withAsync (runLiveWith clock config [(PlayerId 1, sleeper, 3), (PlayerId 2, pure (), 7)]) $ \game -> do
-    awaitTrace events (hasWait (PlayerId 1))
-    advance (addUTCTime 60 simulationStart)
+  let sleeper = wait (duration + fromInteger overrun) >> error "live runner resumed a wait beyond closure"
+      config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
+  Async.withAsync (runLiveWith clock config [(first, sleeper, firstSecret), (second, pure (), secondSecret)]) $ \game -> do
+    awaitTrace events (hasWait first)
+    advance (addUTCTime duration start)
     final <- Async.wait game
-    assertEqual "idle closure" [Settlement 10 0, Settlement 10 0] final
+    pure (final === [Settlement total 0, Settlement total 0])
 
--- Hold the first processed request in the host trace callback, then fill the
--- queue and start another writer. Shutdown must release both queued reply
--- waiters and writers; closure must not sit behind the saturated request queue.
-testSaturatedShutdown :: Bool -> IO ()
-testSaturatedShutdown failExchange = do
-  (clock, advance) <- manualClock
-  runtime <- newLiveRuntime 1
-  entered <- newEmptyTMVarIO
-  release <- newEmptyTMVarIO
-  count <- newTVarIO (0 :: Int)
+-- All submissions compete for the same engine; no fills or updates may be lost.
+prop_concurrentOrders :: Scenario -> ValidOrder -> Positive Int -> Property
+prop_concurrentOrders scenario generated (Positive count) = liveProperty "concurrent order updates" $ do
+  let initial = scenarioEngine scenario
+      ((buyer, _), (seller, _)) = scenarioPlayers scenario
+      order = validOrder generated
+      Price price = limitPrice order
+      volume = toInteger count * orderQuantity order
+  (clock, advance) <- manualClock (scenarioStart scenario)
+  events <- newTVarIO []
+  runtime <- newLiveRuntime clock (record events) initial
+  let submit (pid, side) = requestLive runtime pid (SubmitOrder order { orderSide = side })
+  replies <- Async.mapConcurrently submit (concat (replicate count [(buyer, Buy), (seller, Sell)]))
+  advance (closesAt (engineInfo initial))
+  final <- runExchange runtime
+  trace <- reverse <$> readTVarIO events
+  pure $ conjoin
+    [ counterexample "all orders accepted" (property (all accepted replies))
+    , length (executedTrades (engineBook final)) === count
+    , accounts (engineBook final) === [(buyer, (volume, -fromInteger volume * price)), (seller, (-volume, fromInteger volume * price))]
+    , nextOrderId (engineBook final) === nextOrderId (engineBook initial) + 2 * toInteger count
+    , counterexample "serialized trace" (replay initial trace === Right final)
+    ]
+  where
+    accepted (Reply (Right _)) = True
+    accepted _ = False
+
+-- Let both settlement continuations finish without high-level cancellation.
+prop_settlementBroadcast :: Scenario -> ValidOrder -> Property
+prop_settlementBroadcast scenario generated = liveProperty "shared settlement notification" $ do
+  let initial = scenarioEngine scenario
+      ((buyer, buyerSecret), (seller, sellerSecret)) = scenarioPlayers scenario
+      order = validOrder generated
+      Price price = limitPrice order
+      total = engineTotal initial
+      payoff = fromInteger (orderQuantity order) * (fromInteger total - price)
+  (clock, advance) <- manualClock (scenarioStart scenario)
+  events <- newTVarIO []
+  runtime <- newLiveRuntime clock (record events) initial
+  let close = closesAt (engineInfo initial)
+      player pid side secret expected = (pid, do
+        void (submitOrder order { orderSide = side })
+        result <- awaitSettlement
+        unless (result == Settlement total expected) (error "wrong shared settlement"), secret)
+      players = [player buyer Buy buyerSecret payoff, player seller Sell sellerSecret (-payoff)]
+  Async.withAsync (Async.mapConcurrently_ (runLivePlayer close runtime) players) $ \workers -> do
+    awaitTrace events (\trace -> all (`hasSettlementWait` trace) [buyer, seller])
+    advance close
+    final <- runExchange runtime
+    Async.wait workers
+    published <- atomically (readTMVar (runtimeFinal runtime))
+    pure (published === final)
+
+-- A caller blocked on the engine must sample time after acquiring it.
+-- No deadline worker is running: the request itself must resolve the game.
+prop_deadlineUnderContention :: Scenario -> ValidOrder -> NonNegative Integer -> Property
+prop_deadlineUnderContention scenario generated (NonNegative lateness) = liveProperty "deadline under lock contention" $ do
+  let initial = scenarioEngine scenario
+      ((pid, _), _) = scenarioPlayers scenario
+      order = validOrder generated
+  (clock, advance) <- manualClock (scenarioStart scenario)
+  runtime <- newLiveRuntime clock (const (pure ())) initial
+  locked <- takeMVar (runtimeEngine runtime)
+  let request = requestLive runtime pid (SubmitOrder order)
+      awaitBlocked caller = do
+        status <- threadStatus (Async.asyncThreadId caller)
+        unless (status == ThreadBlocked BlockedOnMVar) (yield >> awaitBlocked caller)
+  rejected <- Async.withAsync request $ \caller -> do
+    awaitBlocked caller
+    advance (addUTCTime (fromInteger lateness) (closesAt (engineInfo initial)))
+    putMVar (runtimeEngine runtime) locked
+    Async.wait caller
+  final <- atomically (readTMVar (runtimeFinal runtime))
+  afterClosure <- request
+  pure $ conjoin
+    [ rejected === Reply (Left GameClosed)
+    , nextOrderId (engineBook final) === nextOrderId (engineBook initial)
+    , afterClosure === Reply (Left GameClosed)
+    ]
+
+-- Match the injected exception, including linked-worker wrappers. A deadlock
+-- timeout or unrelated exception must never count as successful supervision.
+isTestFailure :: String -> SomeException -> Bool
+isTestFailure message err = case fromException err of
+  Just (Async.ExceptionInLinkedThread _ cause) -> isTestFailure message cause
+  Nothing -> fromException err == Just (userError message)
+
+prop_lockRecovery :: Scenario -> ValidOrder -> Property
+prop_lockRecovery scenario generated = liveProperty "lock recovery after a callback exception" $ do
+  let initial = scenarioEngine scenario
+      ((first, _), (second, _)) = scenarioPlayers scenario
+  (clock, _) <- manualClock (scenarioStart scenario)
   let trace event = case event of
-        RequestHandled _ _ _ _ -> do
-          atomically (modifyTVar' count (+ 1) >> putTMVar entered ())
-          atomically (readTMVar release)
-          if failExchange then ioError (userError "exchange failed") else pure ()
+        RequestHandled _ pid _ _ | pid == first -> throwIO (userError "trace failed")
         _ -> pure ()
-      request = requestLive runtime (PlayerId 1) GetExchangeState
-  Async.withAsync request $ \first ->
-    Async.withAsync (runExchange clock trace runtime fixture) $ \server -> do
-      atomically (readTMVar entered)
-      Async.withAsync request $ \queued -> do
-        atomically (isFullTBQueue (requestQueue runtime) >>= check)
-        Async.withAsync request $ \writer -> do
-          advance (addUTCTime 60 simulationStart)
-          atomically (putTMVar release ())
-          result <- Async.waitCatch server
-          case (failExchange, result) of
-            (True, Left _) -> pure ()
-            (False, Right final) -> assertEqual "resolved" (Resolved 10) (enginePhase final)
-            _ -> ioError (userError "unexpected exchange termination")
-          firstResult <- Async.wait first
-          if failExchange then assertEqual "in-flight failure" (Left LiveStopped) firstResult
-            else case firstResult of
-              Right (Reply snapshot) -> assertEqual "pre-closure snapshot" Trading (gamePhase snapshot)
-              _ -> ioError (userError "first request did not receive its reply")
-          Async.wait queued >>= assertEqual "queued reply released" (Left LiveStopped)
-          Async.wait writer >>= assertEqual "blocked writer released" (Left LiveStopped)
-          request >>= assertEqual "admission after stop" (Left LiveStopped)
-          readTVarIO count >>= assertEqual "no processing after closure" 1
+  runtime <- newLiveRuntime clock trace initial
+  let submit pid = requestLive runtime pid (SubmitOrder (validOrder generated))
+  result <- try (submit first)
+  restored <- readMVar (runtimeEngine runtime)
+  next <- submit second
+  pure $ conjoin
+    [ counterexample "trace exception propagated" (property (either (isTestFailure "trace failed") (const False) result))
+    , counterexample "rollback" (restored === initial)
+    , counterexample "lock released" (next === Reply (Right (OrderId (nextOrderId (engineBook initial)))))
+    ]
 
--- Advance time in the authoritative read after dequeueing. A request queued
--- before closure but processed at the deadline must go through GameClosed.
-testDeadlineBetweenDequeueAndHandle :: IO ()
-testDeadlineBetweenDequeueAndHandle = do
-  (baseClock, advance) <- manualClock
-  calls <- newTVarIO (0 :: Int)
-  let clock = baseClock { clockNow = do
-        call <- atomically $ do
-          n <- readTVar calls
-          writeTVar calls (n + 1)
-          pure n
-        unless (call == 0) (advance (addUTCTime 60 simulationStart))
-        clockNow baseClock }
-  runtime <- newLiveRuntime 1
-  reply <- newEmptyTMVarIO
-  atomically $ writeTBQueue (requestQueue runtime)
-    (Request (PlayerId 1) (SubmitOrder (LimitOrder Buy (Price 5) 1)) reply)
-  final <- runExchange clock (const (pure ())) runtime fixture
-  atomically (readTMVar reply) >>= assertEqual "deadline rejection" (Reply (Left GameClosed))
-  assertEqual "no late order ID allocated" 1 (nextOrderId (engineBook final))
-
-testPlayerFailure :: Bool -> IO ()
-testPlayerFailure inPayload = do
-  (clock, advance) <- manualClock
+-- Both failure sites remain separate properties so every run covers both.
+prop_playerFailure :: Bool -> Scenario -> ValidOrder -> Positive Integer -> Property
+prop_playerFailure inPayload scenario generated (Positive overrun) = liveProperty name $ do
+  let ((first, firstSecret), (second, secondSecret)) = scenarioPlayers scenario
+      start = scenarioStart scenario
+      (failureAt, _, duration) = scenarioTimes scenario
+  (clock, advance) <- manualClock start
   events <- newTVarIO []
   let failing = do
-        wait 1
+        wait failureAt
         if inPayload
-          then void (submitOrder (LimitOrder Buy (Price (error "bad price")) 1))
-          else error "player failed"
-      config = defaultLiveConfig { liveDuration = 60, onLiveEvent = record events }
-  Async.withAsync (runLiveWith clock config [(PlayerId 1, failing, 3), (PlayerId 2, wait 120, 7)]) $ \game -> do
-    awaitTrace events (\trace -> hasWait (PlayerId 1) trace && hasWait (PlayerId 2) trace)
-    advance (addUTCTime 1 simulationStart)
+          then void (submitOrder (validOrder generated) { limitPrice = Price (throw (userError name)) })
+          else throw (userError name)
+      config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
+  Async.withAsync (runLiveWith clock config
+    [(first, failing, firstSecret), (second, wait (duration + fromInteger overrun), secondSecret)]) $ \game -> do
+    awaitTrace events (\trace -> hasWait first trace && hasWait second trace)
+    advance (addUTCTime failureAt start)
     result <- Async.waitCatch game
-    case result of
-      Left _ -> pure ()
-      Right _ -> ioError (userError "worker exception was swallowed")
     trace <- readTVarIO events
     let orders :: [()]
         orders = [() | RequestHandled _ _ (SubmitOrder _) _ <- trace]
-    assertEqual "failed payload stays in worker" [] orders
+    pure $ conjoin
+      [ counterexample "worker exception propagated" (property (either (isTestFailure name) (const False) result))
+      , counterexample "failed payload stays in worker" (orders === [])
+      ]
+  where
+    name = if inPayload then "player request payload failure" else "player evaluation failure"
 
-testExchangeFailureSupervision :: IO ()
-testExchangeFailureSupervision = do
-  (clock, _) <- manualClock
-  let config = defaultLiveConfig { onLiveEvent = \_ -> throwIO (userError "trace failed") }
-  result <- try (runLiveWith clock config [(PlayerId 1, void getExchangeState, 3)])
-  case result of
-    Left (_ :: SomeException) -> pure ()
-    Right _ -> ioError (userError "exchange exception was swallowed")
+prop_exchangeFailureSupervision :: Scenario -> Property
+prop_exchangeFailureSupervision scenario = liveProperty "exchange failure supervision" $ do
+  let ((pid, secret), _) = scenarioPlayers scenario
+      (_, _, duration) = scenarioTimes scenario
+  (clock, _) <- manualClock (scenarioStart scenario)
+  let config = defaultLiveConfig
+        { liveDuration = duration, onLiveEvent = \_ -> throwIO (userError "trace failed") }
+  result <- try (runLiveWith clock config [(pid, void getExchangeState, secret)])
+  pure $ counterexample "exchange exception propagated" $
+    property (either (isTestFailure "trace failed") (const False) result)
 
-testRealClock :: IO ()
-testRealClock = do
-  result <- runLiveFor 0.01 [(PlayerId 1, void awaitSettlement, 7)]
-  assertEqual "real timer settlement" [Settlement 7 0] result
-
-testInvalidCapacity :: IO ()
-testInvalidCapacity = do
-  result <- try (newLiveRuntime 0)
-  case result of
-    Left (_ :: SomeException) -> pure ()
-    Right _ -> ioError (userError "zero-capacity queue accepted")
-
-runLiveTests :: IO Bool
-runLiveTests = and <$> forM
-  [ ("concurrent players, waits, settlement and replay", testConcurrentPlayers)
-  , ("idle closure and cancellation of long waits", testStopsAtClosure)
-  , ("closure with a saturated queue", testSaturatedShutdown False)
-  , ("exchange failure with a saturated queue", testSaturatedShutdown True)
-  , ("deadline between dequeue and handling", testDeadlineBetweenDequeueAndHandle)
-  , ("player evaluation failure", testPlayerFailure False)
-  , ("player request payload failure", testPlayerFailure True)
-  , ("exchange failure supervision", testExchangeFailureSupervision)
-  , ("real clock smoke test", testRealClock)
-  , ("invalid queue capacity", testInvalidCapacity)
-  ] (\(name, action) -> do
-      -- Timeouts are deadlock guards, never a way to order concurrent actions.
-      result <- timeout 5000000 (try action)
-      case result of
-        Just (Right ()) -> putStrLn ("PASS: " ++ name) >> pure True
-        Just (Left (err :: SomeException)) ->
-          putStrLn ("FAIL: " ++ name ++ ": " ++ displayException err) >> pure False
-        Nothing -> putStrLn ("FAIL: " ++ name ++ ": timed out") >> pure False)
+prop_realClock :: Property
+prop_realClock = forAllShrink arbitrary shrink $ \(identifier, secret) ->
+  -- Bound wall-clock cost to 10 ms per case; still exercise a positive real timer.
+  forAllShrink (chooseInteger (1, 10000)) (filter (> 0) . shrink) $ \micros ->
+    liveProperty "real clock settlement" $ do
+      result <- runLiveFor (fromRational (micros % 1000000))
+        [(PlayerId identifier, void awaitSettlement, secret)]
+      pure (result === [Settlement (toInteger secret) 0])

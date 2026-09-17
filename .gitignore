@@ -27,3 +27,4 @@ cabal.project.local~
 .HTF/
 .ghc.environment.*
 runghc
+questions.md

@@ -4,13 +4,13 @@
 module TradingGame.Live where
 
 import Control.Concurrent.Async (link, mapConcurrently_, withAsync)
+import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.DeepSeq (rnf)
-import Control.Exception (evaluate, finally)
-import Control.Monad (when)
+import Control.Exception (evaluate)
+import Control.Monad (void, when)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
-import Numeric.Natural (Natural)
 import TradingGame.Core
 import TradingGame.Player
 
@@ -40,103 +40,69 @@ newLiveClock = do
           pure (readTVar fired >>= check)
   pure (LiveClock now alarm)
 
--- Host-only instrumentation, in exchange processing order. A parked settlement
--- produces another RequestHandled when its final answer is calculated at close.
+-- Host-only instrumentation, serialized with engine updates. Deferred settlement
+-- requests are recorded once as WhenResolved; all waiters share the final engine.
 data LiveEvent where
   RequestHandled :: UTCTime -> PlayerId -> TradingGame m a -> Decision a -> LiveEvent
   ExchangeClosed :: UTCTime -> LiveEvent
 
 data LiveConfig = LiveConfig
   { liveDuration :: NominalDiffTime
-  , liveQueueCapacity :: Natural
-  -- Runs synchronously in the exchange thread. Keep it short; exceptions abort
-  -- the run. The trace is private to the host, including private-number replies.
+  -- Runs under the engine lock. Keep it short; exceptions abort the run.
+  -- Traces are private to the host, including private-number replies.
   , onLiveEvent :: LiveEvent -> IO ()
   }
 
 defaultLiveConfig :: LiveConfig
-defaultLiveConfig = LiveConfig 3600 256 (const (pure ()))
-
-data LiveFailure = LiveStopped deriving (Eq, Show)
-
--- Continuations remain in player workers; only typed requests cross the queue.
-data Request where
-  Request :: PlayerId -> TradingGame m a -> TMVar (Decision a) -> Request
+defaultLiveConfig = LiveConfig 3600 (const (pure ()))
 
 data LiveRuntime = LiveRuntime
-  { requestQueue :: TBQueue Request
-  , runtimeStopped :: TVar Bool
+  { runtimeClock :: LiveClock
+  , runtimeTrace :: LiveEvent -> IO ()
+  , runtimeEngine :: MVar Engine
+  , runtimeFinal :: TMVar Engine
   }
 
-newLiveRuntime :: Natural -> IO LiveRuntime
-newLiveRuntime capacity = do
-  when (capacity == 0) $ ioError (userError "liveQueueCapacity must be positive")
-  LiveRuntime <$> newTBQueueIO capacity <*> newTVarIO False
+newLiveRuntime :: LiveClock -> (LiveEvent -> IO ()) -> Engine -> IO LiveRuntime
+newLiveRuntime clock trace initial =
+  LiveRuntime clock trace <$> newMVar initial <*> newEmptyTMVarIO
 
--- Admission and reply waiting MUST be separate transactions. The stopped flag
--- wakes both a producer blocked on a full queue and a caller waiting for a reply.
-requestLive
-  :: LiveRuntime -> PlayerId -> TradingGame m a
-  -> IO (Either LiveFailure (Decision a))
+-- Sample time only after acquiring the lock. Masking keeps final publication
+-- and the engine commit together; exceptions restore the previous engine.
+modifyLiveEngine :: LiveRuntime -> (UTCTime -> Engine -> IO (Engine, a)) -> IO a
+modifyLiveEngine runtime action = modifyMVarMasked (runtimeEngine runtime) $ \engine -> do
+  now <- clockNow (runtimeClock runtime)
+  (updated, result) <- action now engine
+  _ <- evaluate updated
+  case (enginePhase engine, enginePhase updated) of
+    (Trading, Resolved _) -> do
+      runtimeTrace runtime (ExchangeClosed now)
+      atomically (putTMVar (runtimeFinal runtime) updated)
+    _ -> pure ()
+  pure (updated, result)
+
+-- Workers apply the shared rules directly. Waiting happens outside the lock;
+-- requests processed at/after the deadline see the resolved engine.
+requestLive :: LiveRuntime -> PlayerId -> TradingGame m a -> IO (Decision a)
 requestLive runtime pid request = do
-  reply <- newEmptyTMVarIO
-  admitted <- atomically $ do
-    stopped <- readTVar (runtimeStopped runtime)
-    if stopped then pure False else do
-      writeTBQueue (requestQueue runtime) (Request pid request reply)
-      pure True
-  if not admitted then pure (Left LiveStopped) else atomically $
-    (Right <$> readTMVar reply) `orElse`
-    (awaitStop runtime >> pure (Left LiveStopped))
+  _ <- evaluate (forceRequest request)
+  modifyLiveEngine runtime $ \now engine -> do
+    let (updated, decision) = handleRequest now pid request engine
+    _ <- evaluate updated
+    runtimeTrace runtime (RequestHandled now pid request decision)
+    pure (updated, decision)
 
-awaitStop :: LiveRuntime -> STM ()
-awaitStop runtime = readTVar (runtimeStopped runtime) >>= check
-
-data PendingSettlement = PendingSettlement PlayerId (TMVar (Decision Settlement))
-
--- A single owner serializes the exchange; STM coordinates transport, not matching.
--- Each request is timestamped immediately before applying the shared rules.
--- The independent alarm closes an idle exchange; checking time on every loop
--- also prevents a busy queue from starving closure.
-runExchange :: LiveClock -> (LiveEvent -> IO ()) -> LiveRuntime -> Engine -> IO Engine
-runExchange clock trace runtime initial =
-  (do
-    alarm <- clockAlarm clock (closesAt (engineInfo initial))
-    loop alarm initial [])
-  `finally` atomically (writeTVar (runtimeStopped runtime) True)
-  where
-    loop alarm engine parked = do
-      now <- clockNow clock
-      current <- evaluate (advanceTo now engine)
-      case enginePhase current of
-        Resolved _ -> do
-          trace (ExchangeClosed now)
-          mapM_ (settle now current) (reverse parked)
-          pure current
-        Trading -> do
-          next <- atomically $
-            (alarm >> pure Nothing) `orElse`
-            (Just <$> readTBQueue (requestQueue runtime))
-          case next of
-            Nothing -> loop alarm current parked
-            Just (Request pid request reply) -> do
-              handledAt <- clockNow clock
-              let (updated, decision) = handleRequest handledAt pid request current
-              _ <- evaluate updated
-              trace (RequestHandled handledAt pid request decision)
-              case decision of
-                WhenResolved -> loop alarm updated (PendingSettlement pid reply : parked)
-                _ -> do
-                  atomically (putTMVar reply decision)
-                  loop alarm updated parked
-
-    settle now engine (PendingSettlement pid reply) = do
-      let (_, decision) = handleRequest now pid AwaitSettlement engine
-      trace (RequestHandled now pid AwaitSettlement decision)
-      atomically (putTMVar reply decision)
+-- Close even when every player has finished or is waiting. Requests also close
+-- the engine at the deadline, so active players cannot keep trading past it.
+runExchange :: LiveRuntime -> IO Engine
+runExchange runtime = do
+  initial <- readMVar (runtimeEngine runtime)
+  clockAlarm (runtimeClock runtime) (closesAt (engineInfo initial)) >>= atomically
+  modifyLiveEngine runtime $ \now engine ->
+    let final = advanceTo now engine in pure (final, final)
 
 -- Force request arguments in the originating worker so player computations do
--- not travel to the exchange as unevaluated order prices, quantities, or waits.
+-- not hold the engine lock while evaluating order prices, quantities, or waits.
 forceRequest :: TradingGame m a -> ()
 forceRequest request = case request of
   SubmitOrder order ->
@@ -146,28 +112,28 @@ forceRequest request = case request of
   WaitUntil target -> rnf target
   _ -> ()
 
-runLivePlayer :: LiveClock -> UTCTime -> LiveRuntime -> Player -> IO ()
-runLivePlayer clock close runtime (pid, program, _) = loop program
+runLivePlayer :: UTCTime -> LiveRuntime -> Player -> IO ()
+runLivePlayer close runtime (pid, program, _) = loop program
   where
+    finished = readTMVar (runtimeFinal runtime)
     loop current = do
       step <- evaluate (stepPlayer current)
       case step of
         Finished -> pure ()
         Requested request resume -> do
-          _ <- evaluate (forceRequest request)
           answer <- requestLive runtime pid request
           case answer of
-            Left LiveStopped -> pure ()
-            Right (Reply value) -> loop (resume value)
-            Right (ResumeAt target)
-              -- Live execution deliberately drops activity at/after closure.
-              | target >= close -> atomically (awaitStop runtime)
+            Reply value -> loop (resume value)
+            ResumeAt target
+              | target >= close -> void (atomically finished)
               | otherwise -> do
-                  alarm <- clockAlarm clock target
+                  alarm <- clockAlarm (runtimeClock runtime) target
                   awake <- atomically $
-                    (awaitStop runtime >> pure False) `orElse` (alarm >> pure True)
+                    (finished >> pure False) `orElse` (alarm >> pure True)
                   when awake (loop (resume ()))
-            Right WhenResolved -> error "runLivePlayer: unresolved settlement reply"
+            WhenResolved -> do
+              final <- atomically finished
+              loop (resume (settlementFor (engineTotal final) pid (engineBook final)))
 
 runLive :: [Player] -> IO [Settlement]
 runLive = runLiveFor 3600
@@ -187,11 +153,11 @@ runLiveWith clock config players = engineSettlements <$> runLiveEngineWith clock
 
 runLiveEngineWith :: LiveClock -> LiveConfig -> [Player] -> IO Engine
 runLiveEngineWith clock config players = do
-  runtime <- newLiveRuntime (liveQueueCapacity config)
   start <- clockNow clock
   let initial = newEngine start (liveDuration config)
         [(pid, toInteger secret) | (pid, _, secret) <- players]
-      worker = runLivePlayer clock (closesAt (engineInfo initial)) runtime
+  runtime <- newLiveRuntime clock (onLiveEvent config) initial
+  let worker = runLivePlayer (closesAt (engineInfo initial)) runtime
   withAsync (mapConcurrently_ worker players) $ \workers -> do
     link workers
-    runExchange clock (onLiveEvent config) runtime initial
+    runExchange runtime
