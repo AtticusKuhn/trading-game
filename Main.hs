@@ -1,35 +1,16 @@
 {-# LANGUAGE DataKinds #-}
 
--- Run: nix develop -c runghc Main.hs
+-- Run: nix run path:.
 module Main where
 
-import Control.Effect (Eff)
 import Control.Monad (unless, void)
 import Data.List (foldl')
-import Data.Ratio ((%))
 import System.Exit (exitFailure)
 import Test.QuickCheck
 import TradingGame
-
--- Each player submits a variable-length list of orders, then waits for settlement.
-genTradingGame :: Gen (Eff '[TradingGame] ())
-genTradingGame = do
-  orders <- listOf genOrder
-  pure $ mapM_ submitOrder orders >> void awaitSettlement
-
-genOrder :: Gen LimitOrder
-genOrder = do
-  side <- elements [Buy, Sell]
-  numerator <- chooseInteger (-20, 20)
-  denominator <- chooseInteger (1, 4)
-  quantity <- chooseInteger (1, 10)
-  pure (LimitOrder side (Price (numerator % denominator)) quantity)
-
-genPlayers :: Gen [(PlayerId, Eff '[TradingGame] (), Int)]
-genPlayers = do
-  count <- chooseInt (1, 8)
-  ids <- take count <$> shuffle (map PlayerId [-20..20])
-  mapM (\pid -> (,,) pid <$> genTradingGame <*> chooseInt (-100, 100)) ids
+import TestSupport
+import EngineTests (engineProperties, discoverLaws)
+import LiveTests (liveProperties, runLiveTests)
 
 -- Eff programs have no Show instance. Print the secrets and resulting
 -- settlements on failure; QuickCheck's replay seed reproduces the programs.
@@ -89,9 +70,11 @@ prop_explicitPlayerIds =
 main :: IO ()
 main = do
   results <- mapM (quickCheckWithResult stdArgs { maxSuccess = 100 })
-    [ prop_settlementsSumToZero
+    ([ prop_settlementsSumToZero
     , prop_singlePlayerSettlementIsZero
     , prop_samePriceLeavesOnlyOneSide
     , prop_explicitPlayerIds
-    ]
-  unless (all isSuccess results) exitFailure
+    ] ++ engineProperties ++ liveProperties)
+  livePassed <- runLiveTests
+  discoverLaws
+  unless (all isSuccess results && livePassed) exitFailure

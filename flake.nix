@@ -1,5 +1,5 @@
 {
-  description = "Haskell development environment with QuickSpec and lexi-lambda/eff";
+  description = "Trading game with shared pure rules, virtual and live runners, and property tests";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -58,23 +58,36 @@
           ghc = haskellPackages.ghcWithPackages (hp: [
             hp.eff
             hp.quickspec
+            hp.async
+            hp.stm
           ]);
 
-          hello = pkgs.writeShellApplication {
-            name = "quickspec-eff-hello";
-            runtimeInputs = [ ghc ];
-            text = ''
-              runghc ${./hello.hs} "$@"
+          tests = pkgs.stdenv.mkDerivation {
+            pname = "trading-game-tests";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSource ./.;
+            nativeBuildInputs = [ ghc ];
+            buildPhase = ''
+              runHook preBuild
+              ghc -threaded -rtsopts -O1 -Wall -Werror -outputdir build -o trading-game-tests Main.hs
+              runHook postBuild
             '';
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 trading-game-tests "$out/bin/trading-game-tests"
+              runHook postInstall
+            '';
+            meta.mainProgram = "trading-game-tests";
           };
         in {
-          inherit pkgs haskellPackages ghc hello;
+          inherit pkgs haskellPackages ghc tests;
         };
     in {
       packages = forAllSystems (system:
         let project = projectFor system;
         in {
-          default = project.hello;
+          default = project.tests;
+          inherit (project) tests;
           inherit (project) ghc;
           inherit (project.haskellPackages) eff quickspec;
         });
@@ -82,7 +95,7 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${(projectFor system).hello}/bin/quickspec-eff-hello";
+          program = "${(projectFor system).tests}/bin/trading-game-tests";
         };
       });
 
@@ -97,10 +110,8 @@
       checks = forAllSystems (system:
         let project = projectFor system;
         in {
-          hello = project.pkgs.runCommand "quickspec-eff-hello-check" { } ''
-            ${project.hello}/bin/quickspec-eff-hello > "$out"
-            grep -F "Hello, world (from eff)!" "$out"
-            grep -F "QuickSpec" "$out"
+          tests = project.pkgs.runCommand "trading-game-check" { } ''
+            ${project.tests}/bin/trading-game-tests +RTS -N2 -RTS > "$out"
           '';
         });
     };
