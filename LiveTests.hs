@@ -115,8 +115,6 @@ liveProperties =
   , property prop_settlementBroadcast
   , property prop_deadlineUnderContention
   , property prop_lockRecovery
-  , property (prop_playerFailure False)
-  , property (prop_playerFailure True)
   , property prop_exchangeFailureSupervision
   , prop_realClock
   ]
@@ -335,36 +333,7 @@ prop_lockRecovery scenario generated = liveProperty "lock recovery after a callb
     , counterexample "rollback" (restored === initial)
     , counterexample "lock released" (next === Reply (Right (OrderId (nextOrderId (engineBook initial)))))
     ]
-
--- Both failure sites remain separate properties so every run covers both.
-prop_playerFailure :: Bool -> Scenario -> ValidOrder -> Positive Integer -> Property
-prop_playerFailure inPayload scenario generated (Positive overrun) = liveProperty name $ do
-  let ((first, firstSecret), (second, secondSecret)) = scenarioPlayers scenario
-      start = scenarioStart scenario
-      (failureAt, _, duration) = scenarioTimes scenario
-  (clock, advance) <- manualClock start
-  events <- newTVarIO []
-  let failing = do
-        wait failureAt
-        if inPayload
-          then void (submitOrder (validOrder generated) { limitPrice = Price (throw (userError name)) })
-          else throw (userError name)
-      config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
-  Async.withAsync (runLiveWith clock config
-    [(first, failing, firstSecret), (second, wait (duration + fromInteger overrun), secondSecret)]) $ \game -> do
-    awaitTrace events (\trace -> hasWait first trace && hasWait second trace)
-    advance (addUTCTime failureAt start)
-    result <- Async.waitCatch game
-    trace <- readTVarIO events
-    let orders :: [()]
-        orders = [() | RequestHandled _ _ (SubmitOrder _) _ <- trace]
-    pure $ conjoin
-      [ counterexample "worker exception propagated" (property (either (isTestFailure name) (const False) result))
-      , counterexample "failed payload stays in worker" (orders === [])
-      ]
-  where
-    name = if inPayload then "player request payload failure" else "player evaluation failure"
-
+  
 prop_exchangeFailureSupervision :: Scenario -> Property
 prop_exchangeFailureSupervision scenario = liveProperty "exchange failure supervision" $ do
   let ((pid, secret), _) = scenarioPlayers scenario

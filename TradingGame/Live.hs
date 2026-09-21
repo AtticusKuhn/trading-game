@@ -6,7 +6,6 @@ module TradingGame.Live where
 import Control.Concurrent.Async (link, mapConcurrently_, withAsync)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.DeepSeq (rnf)
 import Control.Exception (evaluate)
 import Control.Monad (void, when)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, diffUTCTime, getCurrentTime)
@@ -85,7 +84,6 @@ modifyLiveEngine runtime action = modifyMVarMasked (runtimeEngine runtime) $ \en
 -- requests processed at/after the deadline see the resolved engine.
 requestLive :: LiveRuntime -> PlayerId -> TradingGame m a -> IO (Decision a)
 requestLive runtime pid request = do
-  _ <- evaluate (forceRequest request)
   modifyLiveEngine runtime $ \now engine -> do
     let (updated, decision) = handleRequest now pid request engine
     _ <- evaluate updated
@@ -100,17 +98,6 @@ runExchange runtime = do
   clockAlarm (runtimeClock runtime) (closesAt (engineInfo initial)) >>= atomically
   modifyLiveEngine runtime $ \now engine ->
     let final = advanceTo now engine in pure (final, final)
-
--- Force request arguments in the originating worker so player computations do
--- not hold the engine lock while evaluating order prices, quantities, or waits.
-forceRequest :: TradingGame m a -> ()
-forceRequest request = case request of
-  SubmitOrder order ->
-    let Price price = limitPrice order
-    in orderSide order `seq` rnf (price, orderQuantity order)
-  Wait seconds -> rnf seconds
-  WaitUntil target -> rnf target
-  _ -> ()
 
 runLivePlayer :: UTCTime -> LiveRuntime -> Player -> IO ()
 runLivePlayer close runtime (pid, program, _) = loop program
