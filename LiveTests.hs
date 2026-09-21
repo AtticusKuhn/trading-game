@@ -7,7 +7,7 @@ import qualified Control.Concurrent.Async as Async
 import Control.Concurrent (yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (SomeException, fromException, throw, throwIO, try)
+import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (foldM, unless, void)
 import Data.Ratio ((%))
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)

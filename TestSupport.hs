@@ -36,6 +36,3 @@ genEngine = do
   let initial = newEngine simulationStart 60 (zip (map PlayerId [1..3]) secrets)
   pure (foldl (\engine (pid, order) ->
     fst (handleRequest simulationStart pid (SubmitOrder order) engine)) initial orders)
-
-fixture :: Engine
-fixture = newEngine simulationStart 60 [(PlayerId 1, 3), (PlayerId 2, 7)]

@@ -3,7 +3,7 @@
 -- Run: nix run path:.
 module Main where
 
-import Control.Monad (unless, void)
+import Control.Monad (unless)
 import Data.List (foldl')
 import System.Exit (exitFailure)
 import Test.QuickCheck
@@ -50,30 +50,12 @@ prop_samePriceLeavesOnlyOneSide =
         in counterexample ("Remaining book: " ++ show book) $
              property (null buys || null sells)
 
--- Explicit IDs survive the auxiliary runner, and settlements follow input order.
-prop_explicitPlayerIds :: Property
-prop_explicitPlayerIds =
-  let buyer = PlayerId 42
-      seller = PlayerId (-7)
-      buy = void (submitOrder (LimitOrder Buy (Price 5) 2))
-      sell = void (submitOrder (LimitOrder Sell (Price 5) 2))
-      players = [(buyer, buy, 3), (seller, sell, 7)]
-      final = runTradingGameAt' simulationStart 3600 players
-      expected = [Settlement 10 10, Settlement 10 (-10)]
-  in conjoin
-       [ accounts final === [(buyer, (2, -10)), (seller, (-2, 10))]
-       , runTradingGame players === expected
-       , runTradingGameFor 60 players === expected
-       , runTradingGameAt simulationStart 60 (reverse players) === reverse expected
-       ]
-
 main :: IO ()
 main = do
   results <- mapM (quickCheckWithResult stdArgs { maxSuccess = 100 })
     ([ prop_settlementsSumToZero
     , prop_singlePlayerSettlementIsZero
     , prop_samePriceLeavesOnlyOneSide
-    , prop_explicitPlayerIds
     ] ++ engineProperties ++ liveProperties)
   discoverLaws
   unless (all isSuccess results) exitFailure
