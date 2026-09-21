@@ -1,16 +1,17 @@
 # Trading Game
 
-Players use the same `Eff '[TradingGame] ()` programs in virtual and real time.
-Each player knows their own private number and trades contracts on the sum of
-all private numbers. The default game lasts one hour.
+Players use the same `Eff (TradingGame ': effs) ()` programs in virtual and real
+time. Each player knows their own private number and trades contracts on the sum
+of all private numbers. The default game lasts one hour.
 
 ```haskell
 {-# LANGUAGE DataKinds #-}
 
+import Control.Effect (run, runIO)
 import Control.Monad (void)
 import TradingGame
 
-players :: [Player]
+players :: [Player effs]
 players =
   [ (PlayerId 42, void (submitOrder (LimitOrder Buy  (Price 5) 2)), 3)
   , (PlayerId (-7), void (submitOrder (LimitOrder Sell (Price 5) 2)), 7)
@@ -18,16 +19,139 @@ players =
 
 -- Pure; advances virtual time directly to the next event.
 simulated :: [Settlement]
-simulated = runTradingGameFor 10 players
+simulated = run (runTradingGameFor 10 players)
 
 -- IO; closes after ten seconds of elapsed real time.
 live :: IO [Settlement]
-live = runLiveFor 10 players
+live = runIO (runConcurrent (runLiveFor 10 players))
 ```
 
 `runTradingGame` and `runLive` use the default one-hour duration. All settlement
 lists follow the input player order. Supply at least one player, with unique IDs.
 Nonpositive durations close immediately.
+
+## Terminal prototype
+
+Run against a passive player offering ten contracts at a bid of 9 and an ask of
+11. Your player can read its own private number with `private`.
+
+```sh
+# Virtual time; waiting and settlement advance the simulation immediately.
+nix run path:.#terminal
+
+# Real time; close after 60 seconds (or supply another integer duration).
+nix run path:.#terminal -- live 60
+```
+
+Commands:
+
+```text
+private
+book
+buy 11 2
+sell 9 1
+wait 5
+settlement
+help
+quit
+```
+
+Prices and seconds accept integers, exact decimals, and fractions such as `3/2`.
+Quantities must be positive integers. Invalid input prints an error and retries;
+EOF acts as `quit`. `settlement` waits for closure. In simulation mode, quitting
+finishes your program and lets virtual time advance to closure. In live mode,
+quitting ends your player, but the session still waits for its deadline. The
+terminal prints your final settlement when the runner returns.
+
+The terminal is a debugging adapter, implemented in `TradingGame.Terminal`, with
+its executable in `TerminalMain.hs`. A blocking terminal read can pause the
+simulator; pure scripted handlers avoid this when testing. The terminal adapter
+is intended for one human player per session.
+
+## Player interaction and effect composition
+
+`TradingGame.Interaction` defines transport-independent `PlayerCommand` and
+`PlayerInfo` types and this effect:
+
+```haskell
+data PlayerInteraction :: Effect where
+  ReadInput :: PlayerInteraction m PlayerCommand
+  SendInfo  :: PlayerInfo -> PlayerInteraction m ()
+```
+
+`interactivePlayer` reads commands, executes them through `TradingGame`, and
+sends typed replies until `Quit`. Its polymorphic signature specializes to
+`Eff '[TradingGame, PlayerInteraction] ()`. It never reads stdin or prints
+anything itself. `runTerminal` is one handler; a scripted handler or a future
+web connection can implement the same operations.
+
+Players, steps, and simulator events carry the remaining effects:
+
+```haskell
+type Player effs = (PlayerId, Eff (TradingGame ': effs) (), Int)
+
+stepPlayer
+  :: Eff (TradingGame ': effs) ()
+  -> Eff effs (PlayerStep effs)
+
+runTradingGameFor
+  :: NominalDiffTime -> [Player effs] -> Eff effs [Settlement]
+
+runLivePlayer
+  :: IOE :< effs
+  => UTCTime -> LiveRuntime -> Player effs -> Eff effs ()
+```
+
+`stepPlayer` handles only `TradingGame`. Its continuations retain the rest of the
+effect stack. The simulator and individual live worker likewise leave other
+effects to the caller. `runLivePlayer` itself does not fork a thread.
+
+The high-level live runners require `Concurrent :< effs` and `IOE :< effs`:
+
+```haskell
+data Concurrent :: Effect where
+  WithWorkers :: [m ()] -> m a -> Concurrent m a
+
+runConcurrent
+  :: IOE :< effs
+  => Eff (Concurrent ': effs) a -> Eff effs a
+```
+
+`WithWorkers` scopes worker lifetimes to its body. Returning, throwing, or
+cancelling the body cancels and joins the workers. Worker exceptions propagate
+to the body and cancel sibling workers. Successful workers do not terminate the
+body. The live runner uses its exchange deadline task as the body.
+
+The caller can handle interaction around the whole runner:
+
+```haskell
+-- The player effect stack is inferred separately in each expression.
+simulatedTerminal :: IO [Settlement]
+simulatedTerminal = runIO $ runTerminal $
+  runTradingGameFor 60 [(PlayerId 1, interactivePlayer, 3)]
+
+liveTerminal :: IO [Settlement]
+liveTerminal = runIO $ runTerminal $ runConcurrent $
+  runLiveFor 60 [(PlayerId 1, interactivePlayer, 3)]
+```
+
+These examples additionally import `TradingGame.Terminal (runTerminal)`.
+Handlers need not all be installed inside individual workers.
+
+The pinned `eff` revision has no public IO-unlifting API. `TradingGame.Concurrent`
+isolates a small bridge using `Control.Effect.Internal`: scoped actions borrow
+the current handler environment, with a separate prompt in each thread. Outer
+handlers are shared and must synchronize mutable resources when multiple
+workers use them. Nonlocal continuation capture or abort across this boundary
+is unsupported and raises an explicit IO error; install such a handler inside
+the worker action instead. Ordinary request/reply handlers, including the
+terminal adapter, work outside the scope. The bridge depends on the pinned
+library internals and should be reviewed if that dependency changes.
+
+Migration from the original API: `Player` now takes an effect-list parameter;
+all simulation entry points return `Eff effs`, so wrap effect-free simulations
+in `run`. High-level live entry points also return `Eff effs`; wrap ordinary live
+runs in `runIO . runConcurrent`, as above.
 
 ## Shared rules and separate scheduling
 
@@ -35,17 +159,17 @@ Nonpositive durations close immediately.
   snapshots, and settlement. The handler returns `Reply`, `ResumeAt`, or
   `WhenResolved`; it does not run continuations or sleep.
 - `TradingGame.Player`: the shared `stepPlayer` evaluator and typed continuations.
-- `TradingGame.Simulation`: the virtual event queue. Every request yields to
-  already runnable players. Waits beyond closure and subsequent player activity
-  are preserved. `simulate` now takes an `Engine` and an event queue; the existing
-  `runTradingGame`, `runTradingGameFor`, `runTradingGameAt`, and
-  `runTradingGameAt'` entry points retain their signatures.
+- `TradingGame.Simulation`: the virtual event queue. Every trading request yields
+  to already runnable players. Waits beyond closure and subsequent player
+  activity are preserved; simulation finishes when all player activity finishes.
 - `TradingGame.Live`: concurrent player workers apply requests directly under an
   `MVar Engine` lock. A deadline task closes idle games; one shared `TMVar Engine`
   publishes the final state to settlement waiters.
 
-`TradingGame` re-exports these modules. The engine, low-level runtime API, and
-trace hook are host-only; player programs receive only the `TradingGame` effect.
+`TradingGame` re-exports these modules, `Interaction`, and `Concurrent`. The engine,
+low-level runtime API, and trace hook are host-only. Interaction replies expose
+only the caller's private number, public snapshots, order results, and the
+caller's settlement.
 
 An order's authoritative time is sampled after acquiring the engine lock.
 Orders processed at or after closure cannot trade, including callers that started
@@ -67,7 +191,7 @@ closure.
 configured :: IO [Settlement]
 configured = do
   clock <- newLiveClock
-  runLiveWith clock
+  runIO $ runConcurrent $ runLiveWith clock
     defaultLiveConfig { liveDuration = 10 }
     players
 ```
@@ -86,15 +210,14 @@ reply events. Traces can contain private-number replies and belong to the host.
 `runLiveEngineWith` exposes the final engine for host inspection. Tests replay
 live traces through the pure engine and compare responses and final state.
 
-The high-level runners retain their signatures. The host-only runtime API now
-uses `newLiveRuntime clock trace initial`, `requestLive runtime pid request`, and
-`runExchange runtime`. `requestLive` returns a `Decision` directly; `WhenResolved`
-asks the caller to wait on `runtimeFinal` outside the engine lock. Queue capacity,
-`Request`, and `LiveFailure`/`LiveStopped` have been removed. Calls made directly
-to a resolved runtime still obey the core rules, including `GameClosed` for orders;
-low-level callers manage their own task lifetimes and exception supervision.
+The host-only runtime API uses `newLiveRuntime clock trace initial`,
+`requestLive runtime pid request`, and `runExchange runtime`. `requestLive`
+returns a `Decision` directly; `WhenResolved` asks the caller to wait on
+`runtimeFinal` outside the engine lock. Calls made directly to a resolved runtime
+still obey the core rules, including `GameClosed` for orders. Low-level callers
+manage their own task lifetimes and exception supervision.
 
-Run the suite or the Nix check with the current working tree, including new files:
+Run the suite or the Nix checks with the current working tree, including new files:
 
 ```sh
 nix run path:. -- +RTS -N2 -RTS
@@ -104,10 +227,14 @@ nix flake check path:.
 The suite includes QuickCheck rule properties, QuickSpec equation discovery,
 live trace replay, concurrent order updates, manually timed players, shared
 settlement notification, idle closure, deadlines under lock contention, lock
-recovery, exception supervision, and a real-clock smoke test.
-All live scenarios run as QuickCheck IO properties with generated, shrinkable
-inputs: player IDs and secrets, prices and quantities, clock offsets and wait
-intervals, and concurrent order counts. Each case creates a fresh runtime.
+recovery, exception supervision, and a real-clock smoke test. Interaction
+properties use a pure scripted handler to check command/reply ordering, effect
+forwarding, waits after closure, and quitting without consuming more input.
+Concurrency properties check cleanup on body return, worker failure, parent
+cancellation, nested scopes, and the nonlocal-control boundary. Nix also builds
+and smoke-tests the terminal executable.
+
+Generated inputs are shrinkable; each IO case creates a fresh runtime.
 Concurrency tests use synchronization barriers; timeouts only guard against
 deadlocks. The real-clock property generates short positive durations to keep
 the suite fast.

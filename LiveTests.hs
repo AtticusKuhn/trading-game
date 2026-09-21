@@ -1,13 +1,14 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module LiveTests (liveProperties) where
+module LiveTests (liveProperties, manualClock, liveProperty) where
 
 import qualified Control.Concurrent.Async as Async
 import Control.Concurrent (yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (SomeException, fromException, throwIO, try)
+import Control.Effect (runIO)
 import Control.Monad (foldM, unless, void)
 import Data.Ratio ((%))
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
@@ -197,7 +198,7 @@ prop_concurrentPlayers scenario generated = liveProperty "concurrent players, wa
       players = [(sellerId, seller, sellerSecret), (buyerId, buyer, buyerSecret)]
       initial = newEngine start duration [(sellerId, toInteger sellerSecret), (buyerId, toInteger buyerSecret)]
       config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
-  Async.withAsync (runLiveEngineWith clock config players) $ \game -> do
+  Async.withAsync (runIO (runConcurrent (runLiveEngineWith clock config players))) $ \game -> do
     awaitTrace events (\trace -> hasWait buyerId trace && hasWait sellerId trace)
     advance (addUTCTime sellerWake start)
     awaitTrace events (hasSettlementWait sellerId)
@@ -222,7 +223,7 @@ prop_stopsAtClosure scenario (Positive overrun) = liveProperty "idle closure and
   events <- newTVarIO []
   let sleeper = wait (duration + fromInteger overrun) >> error "live runner resumed a wait beyond closure"
       config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
-  Async.withAsync (runLiveWith clock config [(first, sleeper, firstSecret), (second, pure (), secondSecret)]) $ \game -> do
+  Async.withAsync (runIO (runConcurrent (runLiveWith clock config [(first, sleeper, firstSecret), (second, pure (), secondSecret)]))) $ \game -> do
     awaitTrace events (hasWait first)
     advance (addUTCTime duration start)
     final <- Async.wait game
@@ -273,7 +274,7 @@ prop_settlementBroadcast scenario generated = liveProperty "shared settlement no
         result <- awaitSettlement
         unless (result == Settlement total expected) (error "wrong shared settlement"), secret)
       players = [player buyer Buy buyerSecret payoff, player seller Sell sellerSecret (-payoff)]
-  Async.withAsync (Async.mapConcurrently_ (runLivePlayer close runtime) players) $ \workers -> do
+  Async.withAsync (Async.mapConcurrently_ (runIO . runLivePlayer close runtime) players) $ \workers -> do
     awaitTrace events (\trace -> all (`hasSettlementWait` trace) [buyer, seller])
     advance close
     final <- runExchange runtime
@@ -341,7 +342,7 @@ prop_exchangeFailureSupervision scenario = liveProperty "exchange failure superv
   (clock, _) <- manualClock (scenarioStart scenario)
   let config = defaultLiveConfig
         { liveDuration = duration, onLiveEvent = \_ -> throwIO (userError "trace failed") }
-  result <- try (runLiveWith clock config [(pid, void getExchangeState, secret)])
+  result <- try (runIO (runConcurrent (runLiveWith clock config [(pid, void getExchangeState, secret)])))
   pure $ counterexample "exchange exception propagated" $
     property (either (isTestFailure "trace failed") (const False) result)
 
@@ -350,6 +351,6 @@ prop_realClock = forAllShrink arbitrary shrink $ \(identifier, secret) ->
   -- Bound wall-clock cost to 10 ms per case; still exercise a positive real timer.
   forAllShrink (chooseInteger (1, 10000)) (filter (> 0) . shrink) $ \micros ->
     liveProperty "real clock settlement" $ do
-      result <- runLiveFor (fromRational (micros % 1000000))
+      result <- runIO $ runConcurrent $ runLiveFor (fromRational (micros % 1000000))
         [(PlayerId identifier, void awaitSettlement, secret)]
       pure (result === [Settlement (toInteger secret) 0])

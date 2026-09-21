@@ -79,15 +79,33 @@
             '';
             meta.mainProgram = "trading-game-tests";
           };
+
+          terminal = pkgs.stdenv.mkDerivation {
+            pname = "trading-game-terminal";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSource ./.;
+            nativeBuildInputs = [ ghc ];
+            buildPhase = ''
+              runHook preBuild
+              ghc -threaded -rtsopts -O1 -Wall -Werror -outputdir build -o trading-game-terminal TerminalMain.hs
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 trading-game-terminal "$out/bin/trading-game-terminal"
+              runHook postInstall
+            '';
+            meta.mainProgram = "trading-game-terminal";
+          };
         in {
-          inherit pkgs haskellPackages ghc tests;
+          inherit pkgs haskellPackages ghc tests terminal;
         };
     in {
       packages = forAllSystems (system:
         let project = projectFor system;
         in {
           default = project.tests;
-          inherit (project) tests;
+          inherit (project) tests terminal;
           inherit (project) ghc;
           inherit (project.haskellPackages) eff quickspec;
         });
@@ -96,6 +114,10 @@
         default = {
           type = "app";
           program = "${(projectFor system).tests}/bin/trading-game-tests";
+        };
+        terminal = {
+          type = "app";
+          program = "${(projectFor system).terminal}/bin/trading-game-terminal";
         };
       });
 
@@ -112,6 +134,12 @@
         in {
           tests = project.pkgs.runCommand "trading-game-check" { } ''
             ${project.tests}/bin/trading-game-tests +RTS -N2 -RTS > "$out"
+          '';
+          terminal = project.pkgs.runCommand "trading-game-terminal-check" { } ''
+            printf 'private\nbuy 11 2\nbook\nsettlement\nquit\n' | \
+              ${project.terminal}/bin/trading-game-terminal sim > "$out"
+            grep -q 'Order accepted' "$out"
+            grep -q 'Resolved sum: 10; your payoff: -2' "$out"
           '';
         });
     };

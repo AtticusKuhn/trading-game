@@ -11,27 +11,27 @@ import Data.Time.Clock (UTCTime(..), NominalDiffTime)
 import TradingGame.Core
 import TradingGame.Player
 
-data Event
+data Event effs
   = CloseExchange
-  | ResumePlayer PlayerId (Eff '[TradingGame] ())
+  | ResumePlayer PlayerId (Eff (TradingGame ': effs) ())
 
 simulationStart :: UTCTime
 simulationStart = UTCTime (fromGregorian 2000 1 1) 0
 
 -- Supply unique player IDs. Settlements follow the input player order.
-runTradingGame :: [Player] -> [Settlement]
+runTradingGame :: [Player effs] -> Eff effs [Settlement]
 runTradingGame = runTradingGameFor 3600
 
-runTradingGameFor :: NominalDiffTime -> [Player] -> [Settlement]
+runTradingGameFor :: NominalDiffTime -> [Player effs] -> Eff effs [Settlement]
 runTradingGameFor = runTradingGameAt simulationStart
 
-runTradingGameAt :: UTCTime -> NominalDiffTime -> [Player] -> [Settlement]
-runTradingGameAt start duration = engineSettlements . simulatePlayers start duration
+runTradingGameAt :: UTCTime -> NominalDiffTime -> [Player effs] -> Eff effs [Settlement]
+runTradingGameAt start duration = fmap engineSettlements . simulatePlayers start duration
 
-runTradingGameAt' :: UTCTime -> NominalDiffTime -> [Player] -> Exchange
-runTradingGameAt' start duration = engineBook . simulatePlayers start duration
+runTradingGameAt' :: UTCTime -> NominalDiffTime -> [Player effs] -> Eff effs Exchange
+runTradingGameAt' start duration = fmap engineBook . simulatePlayers start duration
 
-simulatePlayers :: UTCTime -> NominalDiffTime -> [Player] -> Engine
+simulatePlayers :: UTCTime -> NominalDiffTime -> [Player effs] -> Eff effs Engine
 simulatePlayers start duration players =
   let initial = newEngine start duration
         [(pid, toInteger secret) | (pid, _, secret) <- players]
@@ -43,20 +43,22 @@ simulatePlayers start duration players =
 -- Each request yields to players already runnable at the same virtual time.
 -- Infinite immediate requests prevent virtual time from advancing. Waits beyond
 -- closure are honored; this runner finishes only when player activity finishes.
-simulate :: Engine -> [(UTCTime, Event)] -> Engine
-simulate engine [] = engine
+simulate :: Engine -> [(UTCTime, Event effs)] -> Eff effs Engine
+simulate engine [] = pure engine
 simulate engine ((now, event) : pending) =
   let current = advanceTo now engine
   in case event of
     CloseExchange -> simulate current pending
-    ResumePlayer pid program -> case stepPlayer program of
-      Finished -> simulate current pending
-      Requested request resume ->
-        let (updated, decision) = handleRequest now pid request current
-            schedule wake next = simulate updated $ sortOn fst
-              (pending ++ [(wake, ResumePlayer pid next)])
-        in case decision of
-          Reply value -> schedule now (resume value)
-          ResumeAt target -> schedule target (resume ())
-          WhenResolved -> schedule (closesAt (engineInfo updated))
-            (awaitSettlement >>= resume)
+    ResumePlayer pid program -> do
+      step <- stepPlayer program
+      case step of
+        Finished -> simulate current pending
+        Requested request resume ->
+          let (updated, decision) = handleRequest now pid request current
+              schedule wake next = simulate updated $ sortOn fst
+                (pending ++ [(wake, ResumePlayer pid next)])
+          in case decision of
+            Reply value -> schedule now (resume value)
+            ResumeAt target -> schedule target (resume ())
+            WhenResolved -> schedule (closesAt (engineInfo updated))
+              (awaitSettlement >>= resume)

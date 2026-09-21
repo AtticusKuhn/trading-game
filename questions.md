@@ -55,3 +55,93 @@ which is `TimeClock` effect that handles
 scheduling, callbacks, waiting, getCurrentTime.
 Would this make the code better or worse? 
 What would be the ramifications? 
+
+
+
+
+
+
+I want to explore a simple prototype of adding player interactivity.⠄It can even be⠐in the
+  terminal for now. I want to add a new effect called something "PlayerInteraction" or
+  something like that which is an effect that requests input from the user and can also send
+  info to⠁the user. With this, make a tradinggame program⠐that has both 
+`Eff '[TraingGame, PlayerInteraction] ()` that just reads a command from the user and executes⡀it.
+  
+It would look something like 
+
+```haskell
+data PlayerInteraction :: Effect where
+    ReadInput :: PlayerInteraction m PlayerCommand
+    SendInfo  :: PlayerInfo -> PlayerInteraction m ()
+```
+Then, an interactive player could look like:
+
+```haskell
+interactivePlayer :: Eff '[TradingGame, PlayerInteraction] ()
+interactivePlayer = loop
+    where
+      loop = do
+        command <- readInput
+        case command of
+          Quit   -> pure ()
+          cmd  -> execute cmd >> loop
+```
+Also, it would teach the simulator to say that `TradingGame` is one effect, but there may be others
+and leave the other effects unhandled.
+so it would be something like 
+
+```haskell
+stepPlayer
+    :: Eff (TradingGame ': effs) ()
+    -> Eff effs (PlayerStep effs)
+```
+and also teach the live runner to leave other effect unhandled. 
+The terminal would just be a simple, prototype handler of the `PlayerInteraction` effect,
+but there can be others as well.
+Do not worry about a blocking terminal read locking up the simulator; that's not a problem because
+when we do property-based testing on the simulator, we'll use a different effect handler.
+The terminal effect-handler will only for user debugging right now.
+I’d generalize the individual live worker to handle only TradingGame, leaving other
+  effects unhandled.
+Maybe something like 
+```haskell
+runLivePlayer
+    :: IOE :< effs
+    => UTCTime
+    -> LiveRuntime
+    -> Player effs
+    -> Eff effs ()
+```
+Also, I don't want to be forced to handle all effects in the worker thread of run-live, so maybe I should
+introduce a new effect for concurrency.
+Maybe something like
+
+```haskell
+data Concurrent :: Effect where
+    WithWorkers :: [m ()] -> m a -> Concurrent m a
+```
+
+with a handler like 
+```haskell
+runConcurrent
+    :: IOE :< effs
+    => Eff (Concurrent ': effs) a
+    -> Eff effs a
+```
+.
+
+  This signature works:
+```haskell 
+runLivePlayer
+    :: IOE :< effs
+    => UTCTime
+    -> LiveRuntime
+    -> Player effs
+    -> Eff effs ()
+```
+  It handles TradingGame and leaves all other effects untouched. The caller chooses how to handle those remaining effects.
+  
+Please implement this.
+Remember to add a small debugging endpoint with a terminal handler, so that the end-user can 
+run the terminal version to debug, but remember that the terminal handler will only be one way 
+to handle the effect (with over a web-connection being a possible future extension direction).

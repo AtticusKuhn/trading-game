@@ -1,15 +1,18 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TypeOperators #-}
 
 module TradingGame.Live where
 
-import Control.Concurrent.Async (link, mapConcurrently_, withAsync)
+import Control.Effect (Eff, IOE, (:<), liftIO)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (evaluate)
 import Control.Monad (void, when)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
+import TradingGame.Concurrent
 import TradingGame.Core
 import TradingGame.Player
 
@@ -99,35 +102,35 @@ runExchange runtime = do
   modifyLiveEngine runtime $ \now engine ->
     let final = advanceTo now engine in pure (final, final)
 
-runLivePlayer :: UTCTime -> LiveRuntime -> Player -> IO ()
+runLivePlayer :: IOE :< effs => UTCTime -> LiveRuntime -> Player effs -> Eff effs ()
 runLivePlayer close runtime (pid, program, _) = loop program
   where
     finished = readTMVar (runtimeFinal runtime)
     loop current = do
-      step <- evaluate (stepPlayer current)
+      step <- stepPlayer current
       case step of
         Finished -> pure ()
         Requested request resume -> do
-          answer <- requestLive runtime pid request
+          answer <- liftIO (requestLive runtime pid request)
           case answer of
             Reply value -> loop (resume value)
             ResumeAt target
-              | target >= close -> void (atomically finished)
+              | target >= close -> void (liftIO (atomically finished))
               | otherwise -> do
-                  alarm <- clockAlarm (runtimeClock runtime) target
-                  awake <- atomically $
+                  alarm <- liftIO (clockAlarm (runtimeClock runtime) target)
+                  awake <- liftIO $ atomically $
                     (finished >> pure False) `orElse` (alarm >> pure True)
                   when awake (loop (resume ()))
             WhenResolved -> do
-              final <- atomically finished
+              final <- liftIO (atomically finished)
               loop (resume (settlementFor (engineTotal final) pid (engineBook final)))
 
-runLive :: [Player] -> IO [Settlement]
+runLive :: (IOE :< effs, Concurrent :< effs) => [Player effs] -> Eff effs [Settlement]
 runLive = runLiveFor 3600
 
-runLiveFor :: NominalDiffTime -> [Player] -> IO [Settlement]
+runLiveFor :: (IOE :< effs, Concurrent :< effs) => NominalDiffTime -> [Player effs] -> Eff effs [Settlement]
 runLiveFor duration players = do
-  clock <- newLiveClock
+  clock <- liftIO newLiveClock
   runLiveWith clock defaultLiveConfig { liveDuration = duration } players
 
 -- Like runTradingGame, results follow input order. Ends at closure even when
@@ -135,16 +138,14 @@ runLiveFor duration players = do
 -- continuation after awaitSettlement runs. Workers are trusted, interruptible
 -- Haskell computations; this is not isolation for untrusted/noninterruptible code.
 -- Any worker/exchange exception aborts the run and cleans up the other workers.
-runLiveWith :: LiveClock -> LiveConfig -> [Player] -> IO [Settlement]
+runLiveWith :: (IOE :< effs, Concurrent :< effs) => LiveClock -> LiveConfig -> [Player effs] -> Eff effs [Settlement]
 runLiveWith clock config players = engineSettlements <$> runLiveEngineWith clock config players
 
-runLiveEngineWith :: LiveClock -> LiveConfig -> [Player] -> IO Engine
+runLiveEngineWith :: (IOE :< effs, Concurrent :< effs) => LiveClock -> LiveConfig -> [Player effs] -> Eff effs Engine
 runLiveEngineWith clock config players = do
-  start <- clockNow clock
+  start <- liftIO (clockNow clock)
   let initial = newEngine start (liveDuration config)
         [(pid, toInteger secret) | (pid, _, secret) <- players]
-  runtime <- newLiveRuntime clock (onLiveEvent config) initial
+  runtime <- liftIO (newLiveRuntime clock (onLiveEvent config) initial)
   let worker = runLivePlayer (closesAt (engineInfo initial)) runtime
-  withAsync (mapConcurrently_ worker players) $ \workers -> do
-    link workers
-    runExchange runtime
+  withWorkers (map worker players) (liftIO (runExchange runtime))

@@ -3,6 +3,7 @@
 -- Run: nix run path:.
 module Main where
 
+import Control.Effect (run)
 import Control.Monad (unless)
 import Data.List (foldl')
 import System.Exit (exitFailure)
@@ -11,13 +12,15 @@ import TradingGame
 import TestSupport
 import EngineTests (engineProperties, discoverLaws)
 import LiveTests (liveProperties)
+import InteractionTests (interactionProperties)
+import ConcurrentTests (concurrentProperties)
 
 -- Eff programs have no Show instance. Print the secrets and resulting
 -- settlements on failure; QuickCheck's replay seed reproduces the programs.
 prop_settlementsSumToZero :: Property
 prop_settlementsSumToZero = checkCoverage $
   forAllShow genPlayers (\players -> "Private numbers: " ++ show [(pid, secret) | (pid, _, secret) <- players]) $ \players ->
-    let settlements = runTradingGame players
+    let settlements = run (runTradingGame players)
         payoffs = map netPayoff settlements
     in cover 10 (any (/= 0) payoffs) "nonzero individual payoffs" $
        counterexample ("Settlements: " ++ show settlements) $
@@ -28,7 +31,7 @@ prop_singlePlayerSettlementIsZero :: Property
 prop_singlePlayerSettlementIsZero =
   forAllShow genTradingGame (const "Generated player program (use replay seed to reproduce)") $ \player ->
     forAll (arbitrary :: Gen Int) $ \secret ->
-      let settlements = runTradingGame [(PlayerId 42, player, secret)]
+      let settlements = run (runTradingGame [(PlayerId 42, player, secret)])
       in counterexample ("Settlements: " ++ show settlements) $
            map netPayoff settlements === [0]
 
@@ -56,6 +59,6 @@ main = do
     ([ prop_settlementsSumToZero
     , prop_singlePlayerSettlementIsZero
     , prop_samePriceLeavesOnlyOneSide
-    ] ++ engineProperties ++ liveProperties)
+    ] ++ engineProperties ++ liveProperties ++ interactionProperties ++ concurrentProperties)
   discoverLaws
   unless (all isSuccess results) exitFailure
