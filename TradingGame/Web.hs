@@ -1,22 +1,22 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeOperators #-}
 
 -- A local debugging adapter. The fixed roster belongs to the host; browser
--- names claim seats and opaque cookies select their associated sessions.
+-- names select existing players and opaque cookies identify browser sessions.
 module TradingGame.Web where
 
-import Control.Concurrent.MVar (readMVar)
 import Control.Concurrent.STM
-import Control.Effect (Eff, IOE, liftIO, runIO)
-import Control.Monad (forM_, replicateM, void, when)
+import Control.Effect (Eff, IOE, (:<), liftIO, runIO)
+import Control.Monad (forM_, void, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B
 import Data.ByteString.Builder (Builder, byteString)
 import qualified Data.ByteString.Lazy as LBS
-import Data.Char (isControl, isSpace)
-import Data.List (sortOn)
+import Data.Char (isSpace)
+import Data.List (find, sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Ratio (denominator, numerator)
 import qualified Data.Text as T
@@ -36,25 +36,29 @@ import TradingGame
 import TradingGame.Terminal (parseCommand)
 import Web.Cookie (parseCookies)
 
-data BrowserSession = BrowserSession
-  { sessionName :: T.Text
-  , sessionPlayer :: Player
+newtype BrowserSession = BrowserSession
+  { sessionPlayer :: Player
   }
 
 data WebGame = WebGame
   { webRuntime :: LiveRuntime
   , webRevision :: TVar Integer
   , webSessions :: TVar (Map.Map BS.ByteString BrowserSession)
-  , webSeats :: [Player]
+  , webPlayers :: [Player]
   , webBots :: [Player]
   }
+
+-- Player identities are fixed; only their private numbers are drawn at startup.
+webPlayerNames :: [String]
+webPlayerNames =
+  ["alice", "bob", "carol", "dan", "eve", "fred", "gwen", "hal", "market-maker", "noise-trader"]
 
 newWebGame :: NominalDiffTime -> IO WebGame
 newWebGame duration = do
   clock <- newLiveClock
   start <- clockNow clock
-  secrets <- replicateM 10 (randomRIO (1, 9))
-  let roster = zipWith (\n secret -> Player (PlayerId n) ("seat-" ++ show n) secret) [1..] secrets
+  roster <- sequence
+    [Player (PlayerId n) name <$> randomRIO (1, 9) | (n, name) <- zip [1..] webPlayerNames]
   revision <- newTVarIO 0
   let changed = atomically (modifyTVar' revision (+1))
       trace (RequestHandled _ _ (SubmitOrder _) _) = changed
@@ -62,14 +66,13 @@ newWebGame duration = do
       trace _ = pure ()
   runtime <- newLiveRuntime clock trace (newEngine start duration roster)
   sessions <- newTVarIO Map.empty
-  pure (WebGame runtime revision sessions (take 8 roster) (drop 8 roster))
+  pure (WebGame runtime revision sessions roster (drop 8 roster))
 
 -- Each HTTP request reinstalls the existing session and trading interpreters.
 -- Identity always comes from the server's cookie table, never form fields.
 asPlayer :: WebGame -> BrowserSession -> Eff '[TradingGame, PlayerSession, IOE] a -> IO a
 asPlayer game session action = do
-  roster <- players <$> readMVar (runtimeEngine (webRuntime game))
-  result <- runIO $ runPlayerSession roster $ do
+  result <- runIO $ runPlayerSession (webPlayers game) $ do
     void (joinGameAsPlayer (displayName (sessionPlayer session)))
     runWithCurrentPlayer (webRuntime game) action
   either (ioError . userError . show) pure result
@@ -82,24 +85,16 @@ lookupSession game request = do
     token <- lookup "trading-session" (parseCookies cookies)
     Map.lookup token sessions
 
-claimSeat :: WebGame -> T.Text -> IO (Either T.Text BS.ByteString)
-claimSeat game rawName = do
-  bytes <- getEntropy 32
-  let token = B.pack (concatMap (\b -> let h = showHex b "" in replicate (2 - length h) '0' ++ h) (BS.unpack bytes))
-      name = T.strip rawName
-  atomically $ do
-    sessions <- readTVar (webSessions game)
-    let occupied = Map.elems sessions
-        available = filter (\p -> playerID p `notElem` map (playerID . sessionPlayer) occupied) (webSeats game)
-    if T.null name || T.length name > 40 || T.any isControl name
-      then pure (Left "Use a name of 1–40 characters without control characters.")
-      else if any ((== name) . sessionName) occupied
-        then pure (Left "That name is already in use. Choose another name; your original browser keeps its seat.")
-        else case available of
-          [] -> pure (Left "All eight player seats are taken. Restart the server for a new game.")
-          player:_ -> do
-            writeTVar (webSessions game) (Map.insert token (BrowserSession name player) sessions)
-            pure (Right token)
+-- Joining creates only a browser session, never a player or a new account.
+-- Exact names match the terminal's PlayerSession semantics, including rejoins.
+joinWebPlayer :: WebGame -> T.Text -> IO (Either T.Text BS.ByteString)
+joinWebPlayer game name = case find ((== T.unpack name) . displayName) (webPlayers game) of
+  Nothing -> pure (Left "Unknown player. Choose a player from this game's roster.")
+  Just player -> do
+    bytes <- getEntropy 32
+    let token = B.pack (concatMap (\b -> let h = showHex b "" in replicate (2 - length h) '0' ++ h) (BS.unpack bytes))
+    atomically $ modifyTVar' (webSessions game) (Map.insert token (BrowserSession player))
+    pure (Right token)
 
 -- Keep form parsing bounded and exact, reusing the terminal's numeric grammar.
 -- Each field must be a single token, so extra commands cannot be smuggled in.
@@ -136,22 +131,20 @@ webApplication game request respond = do
       redirect headers = respond (htmlResponse status303 ((hLocation, "/"):headers) mempty)
   case (requestMethod request, pathInfo request) of
     ("GET", []) -> case session of
-      Nothing -> page (joinView Nothing)
+      Nothing -> page (joinView (webPlayers game) Nothing)
       Just current -> do
         (snapshot, settlement) <- playerSnapshot game current
         page (gameView current snapshot settlement)
-    ("POST", ["join"]) -> case session of
-      Just _ -> redirect []
-      Nothing -> do
-        form <- readForm request
-        result <- case form of
-          Left problem -> pure (Left (T.pack problem))
-          Right fields -> case lookup "name" fields >>= either (const Nothing) Just . T.decodeUtf8' of
-            Nothing -> pure (Left "Enter a valid player name.")
-            Just name -> claimSeat game name
-        case result of
-          Left problem -> page (joinView (Just problem))
-          Right token -> redirect [("Set-Cookie", "trading-session=" <> token <> "; Path=/; HttpOnly; SameSite=Strict")]
+    ("POST", ["join"]) -> do
+      form <- readForm request
+      result <- case form of
+        Left problem -> pure (Left (T.pack problem))
+        Right fields -> case lookup "name" fields >>= either (const Nothing) Just . T.decodeUtf8' of
+          Nothing -> pure (Left "Enter a valid player name.")
+          Just name -> joinWebPlayer game name
+      case result of
+        Left problem -> respond (htmlResponse status400 [] (document (joinView (webPlayers game) (Just problem))))
+        Right token -> redirect [("Set-Cookie", "trading-session=" <> token <> "; Path=/; HttpOnly; SameSite=Strict")]
     ("POST", ["orders"]) -> case session of
       Nothing -> respond (htmlResponse status401 [("HX-Redirect", "/")] (H.p "Join as a player first."))
       Just current -> do
@@ -231,23 +224,24 @@ document content = H.docTypeHtml ! A.lang "en" $ do
       H.h1 ! A.class_ "text-3xl font-bold" $ "Trading Game"
       H.p ! A.class_ "mt-2 text-slate-600" $ "Trade contracts on the sum of ten private numbers. Each number is between 1 and 9."
     content
-    H.footer ! A.class_ "text-sm text-slate-500" $ "In-memory demo · 8 human seats + 2 trading bots · Restart the server to reset."
+    H.footer ! A.class_ "text-sm text-slate-500" $ "In-memory demo · 8 human players + 2 trading bots · Restart the server to reset."
 
-joinView :: Maybe T.Text -> Html
-joinView problem = panel $ do
+joinView :: [Player] -> Maybe T.Text -> Html
+joinView roster problem = panel $ do
   H.h2 ! A.class_ "text-xl font-semibold" $ "Join as a player"
-  H.p "Choose a name to claim a seat. Your browser remembers your seat and private number."
-  H.p ! A.class_ "text-sm text-slate-600" $ "All ten private numbers are fixed at server startup; unclaimed seats still count toward the sum. The clock starts when the server starts."
+  H.p "Choose an existing player. Rejoining from any browser returns to the same private number, orders, and account."
+  H.p ! A.class_ "text-sm text-slate-600" $ "All ten private numbers are fixed at server startup; every player counts toward the sum, even before joining. The clock starts when the server starts."
   forM_ problem $ \message -> H.p ! A.role "alert" ! A.class_ "text-red-700" $ toHtml message
   H.form ! A.method "post" ! A.action "/join" ! A.class_ "max-w-sm space-y-3" $ do
     H.label ! A.for "name" ! A.class_ "block" $ "Player name"
-    H.input ! A.id "name" ! A.name "name" ! A.required "" ! A.maxlength "40" ! A.autocomplete "nickname" ! A.class_ inputClass
+    H.select ! A.id "name" ! A.name "name" ! A.required "" ! A.class_ inputClass $
+      forM_ roster $ \player -> H.option ! A.value (H.toValue (displayName player)) $ toHtml (displayName player)
     H.button ! A.type_ "submit" ! A.class_ "rounded bg-indigo-700 px-4 py-2 font-semibold text-white" $ "Join game"
 
 gameView :: BrowserSession -> ExchangeState -> Maybe Settlement -> Html
 gameView session snapshot settlement = do
   panel $ do
-    H.h2 ! A.class_ "text-xl font-semibold" $ toHtml ("Playing as " <> sessionName session)
+    H.h2 ! A.class_ "text-xl font-semibold" $ toHtml ("Playing as " ++ displayName (sessionPlayer session))
     H.p $ do
       "Your private number: "
       H.strong ! A.class_ "font-mono text-2xl text-indigo-700" $ toHtml (show (privateNumber (sessionPlayer session)))
@@ -322,7 +316,7 @@ priceText (Price value) = number value
 
 -- Both bots use only TradingGame effects. One maintains a small two-sided
 -- book; the other crosses its best quotes, so a fresh demo visibly trades.
-marketMaker :: Eff '[TradingGame, PlayerSession, IOE] ()
+marketMaker :: TradingGame :< effs => Eff effs ()
 marketMaker = do
   secret <- getMyPrivateNumber
   let bid = Price (fromInteger (secret + 9 * 5 - 2))
@@ -336,7 +330,7 @@ marketMaker = do
           loop
   loop
 
-noiseTrader :: Eff '[TradingGame, PlayerSession, IOE] ()
+noiseTrader :: TradingGame :< effs => Eff effs ()
 noiseTrader = loop Buy
   where
     loop side = do
@@ -352,10 +346,10 @@ noiseTrader = loop Buy
 runWebServer :: Int -> NominalDiffTime -> IO ()
 runWebServer port duration = do
   game <- newWebGame duration
-  let botActions = zipWith (\player program -> liftIO (asPlayer game (BrowserSession "bot" player) program))
+  let botActions = zipWith (\player program -> liftIO (asPlayer game (BrowserSession player) program))
         (webBots game) [marketMaker, noiseTrader]
       settings = Warp.setHost "127.0.0.1" $ Warp.setPort port $ Warp.setBeforeMainLoop
-        (putStrLn ("Trading Game: http://127.0.0.1:" ++ show port ++ " (" ++ show duration ++ ", 8 seats + 2 bots)")) Warp.defaultSettings
+        (putStrLn ("Trading Game: http://127.0.0.1:" ++ show port ++ " (" ++ show duration ++ ", 8 human players + 2 bots)")) Warp.defaultSettings
   runIO $ runConcurrent $ withWorkers
     (liftIO (void (runExchange (webRuntime game))) : botActions)
     (liftIO (Warp.runSettings settings (webApplication game)))

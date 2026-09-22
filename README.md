@@ -38,19 +38,25 @@ nix run path:.#web
 nix run path:.#web -- 3000 60
 ```
 
-Open `http://127.0.0.1:3000`, enter a name, and place buy or sell limit orders.
+Open `http://127.0.0.1:3000`, select a player, and place buy or sell limit orders.
 The page shows your private number, open buys and sells, the latest twenty
 trades, and your payoff at settlement. Prices accept integers, exact decimals,
 and fractions. An accepted order can remain open until another order matches.
 
-The host generates ten private numbers between 1 and 9 at startup: eight human
-seats and two bots. Choosing a name claims one human seat; unused seats still
-contribute to the sum. The fixed roster and sum never change when someone joins.
+The roster is fixed at startup by `webPlayerNames` in `TradingGame.Web`:
+`alice`, `bob`, `carol`, `dan`, `eve`, `fred`, `gwen`, `hal`, `market-maker`, and
+`noise-trader`. The last two players also run bot programs. Each player receives
+a private number between 1 and 9 at startup; every player contributes to the sum,
+even before anyone joins. Joining selects an existing player by exact,
+case-sensitive name. Unknown names return an HTTP 400 error and never create
+players. Rejoining from the same or another browser uses the same private number,
+orders, positions, and settlement.
+
 Use separate browser profiles/private windows for different players. An opaque
-HttpOnly cookie preserves your seat across refreshes; names are unique, and a
-different browser cannot take over an existing name. Closing a tab does not
-release its seat. The clock starts at server startup, and restarting resets
-all state. The server binds to loopback for local debugging.
+HttpOnly cookie remembers the selected player across refreshes. Names select
+identities in this trusted local demo; they are not authentication credentials.
+The clock starts at server startup, and restarting resets all state. The server
+binds to loopback for local debugging.
 
 One bot replenishes a small two-sided book every two seconds, estimating the sum
 from its own private number; the other alternates buying and selling at the best
@@ -68,7 +74,8 @@ from pinned CDN URLs, so the browser needs internet access.
 
 The terminal entrypoint below remains available. `nix flake check path:.` also
 builds the web executable and runs QuickCheck properties covering HTTP order
-gating, identity binding, concurrent seat claims, name escaping, and SSE framing.
+gating, identity binding, concurrent joins, account continuity, unknown-name rejection,
+and SSE framing.
 
 ## Terminal prototype
 

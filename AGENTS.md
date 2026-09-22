@@ -37,7 +37,8 @@ data TradingGame :: Effect where
   WaitUntil :: UTCTime -> TradingGame m ()
   
   
-
+-- The list of players should be a per-game static constant which is established at the beginning of the game and does not change over the course of the game. You cannot "dynamically add" a new player during a running game.
+  game.
 data PlayerSession :: Effect where
     JoinGameAsPlayer :: String -> PlayerSession m LoginResult
     Logout :: PlayerSession m LogoutResult
@@ -61,4 +62,7 @@ Write genuinely property-based tests.
 Tests should not be long.
 They should not be re-enacting long scenarios, just simple properties.
 Only write tests that John Hughes would approve of.
+If a test has a hardcoded constant in it, that's code-smell that this
+test is potentially just a unit test in disguise, and not a true
+property-based quickcheck property.
 
