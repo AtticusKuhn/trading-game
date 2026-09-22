@@ -30,6 +30,46 @@ live = runIO (runConcurrent (runLiveFor 10 programs))
 lists follow the input player order. Supply at least one player, with unique IDs and nonblank, unique display names.
 Nonpositive durations close immediately.
 
+## Web debugging prototype
+
+```sh
+nix run path:.#web
+# Custom port and game duration in seconds (default: 3000, 3600):
+nix run path:.#web -- 3000 60
+```
+
+Open `http://127.0.0.1:3000`, enter a name, and place buy or sell limit orders.
+The page shows your private number, open buys and sells, the latest twenty
+trades, and your payoff at settlement. Prices accept integers, exact decimals,
+and fractions. An accepted order can remain open until another order matches.
+
+The host generates ten private numbers between 1 and 9 at startup: eight human
+seats and two bots. Choosing a name claims one human seat; unused seats still
+contribute to the sum. The fixed roster and sum never change when someone joins.
+Use separate browser profiles/private windows for different players. An opaque
+HttpOnly cookie preserves your seat across refreshes; names are unique, and a
+different browser cannot take over an existing name. Closing a tab does not
+release its seat. The clock starts at server startup, and restarting resets
+all state. The server binds to loopback for local debugging.
+
+One bot replenishes a small two-sided book every two seconds, estimating the sum
+from its own private number; the other alternates buying and selling at the best
+available quotes every three seconds. Both use the existing trading effects and
+stop at settlement. The server remains available to inspect the final game.
+
+`TradingGame.Web` renders Blaze HTML and uses WAI/Warp. The order form posts with
+HTMX; the server pushes rendered HTML directly through the
+[HTMX SSE extension](https://htmx.org/extensions/sse/). Exchange changes wake the
+streams through STM, with keep-alive comments every fifteen seconds and a full
+snapshot on reconnect. Updates leave the order form intact. There is no client
+polling or custom JavaScript. HTMX, its SSE extension, and the development-only
+[Tailwind browser build](https://tailwindcss.com/docs/installation/play-cdn) load
+from pinned CDN URLs, so the browser needs internet access.
+
+The terminal entrypoint below remains available. `nix flake check path:.` also
+builds the web executable and runs QuickCheck properties covering HTTP order
+gating, identity binding, concurrent seat claims, name escaping, and SSE framing.
+
 ## Terminal prototype
 
 Run against a passive player offering ten contracts at a bid of 9 and an ask of

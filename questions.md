@@ -278,7 +278,16 @@ data PlayerSession :: Effect where
 Would this be a good or bad design decision? What would be the ramifications? 
 
 
+
 Can you please implement a web UI prototype? 
 It doesn't exist yet.
 Please make a simple debugging applicaton. Do not remove the terminal entrypoint.
 If you need to add BlazeHTML/HTMX to the nix flake, you may do so.
+When the player opens the webpage, they should have to join as a player with a name.
+Once the player has joined, they can make orders.
+Use SSE instead of polling on the client side. 
+The server should send HTML, not JSON to the client.
+Try not to use too much client-side JS, but rely on HTMX as much as possible.
+Have a way to run the web server via the command-line.
+In the web-application, the user should be able to see open orders and to make new orders.
+The web-application should also have bot-players in it that make trades.

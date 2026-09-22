@@ -60,6 +60,14 @@
             hp.quickspec
             hp.async
             hp.stm
+            hp.blaze-html
+            hp.wai
+            hp.wai-extra
+            hp.warp
+            hp.http-types
+            hp.cookie
+            hp.entropy
+            hp.random
           ]);
 
           tests = pkgs.stdenv.mkDerivation {
@@ -97,15 +105,32 @@
             '';
             meta.mainProgram = "trading-game-terminal";
           };
+          web = pkgs.stdenv.mkDerivation {
+            pname = "trading-game-web";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSource ./.;
+            nativeBuildInputs = [ ghc ];
+            buildPhase = ''
+              runHook preBuild
+              ghc -threaded -rtsopts -O1 -Wall -Werror -outputdir build -o trading-game-web WebMain.hs
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 trading-game-web "$out/bin/trading-game-web"
+              runHook postInstall
+            '';
+            meta.mainProgram = "trading-game-web";
+          };
         in {
-          inherit pkgs haskellPackages ghc tests terminal;
+          inherit pkgs haskellPackages ghc tests terminal web;
         };
     in {
       packages = forAllSystems (system:
         let project = projectFor system;
         in {
           default = project.tests;
-          inherit (project) tests terminal;
+          inherit (project) tests terminal web;
           inherit (project) ghc;
           inherit (project.haskellPackages) eff quickspec;
         });
@@ -118,6 +143,10 @@
         terminal = {
           type = "app";
           program = "${(projectFor system).terminal}/bin/trading-game-terminal";
+        };
+        web = {
+          type = "app";
+          program = "${(projectFor system).web}/bin/trading-game-web";
         };
       });
 
@@ -135,6 +164,7 @@
           tests = project.pkgs.runCommand "trading-game-check" { } ''
             ${project.tests}/bin/trading-game-tests +RTS -N2 -RTS > "$out"
           '';
+          web = project.web;
           terminal = project.pkgs.runCommand "trading-game-terminal-check" { } ''
             printf 'join alice\nprivate\nbuy 11 2\nlogout\njoin alice\nbook\nsettlement\nquit\n' | \
               ${project.terminal}/bin/trading-game-terminal sim > "$out"
