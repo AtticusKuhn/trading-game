@@ -1,3 +1,4 @@
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module WebTests (webProperties) where
@@ -17,7 +18,7 @@ import Network.HTTP.Types
 import Network.Wai
 import Network.Wai.Test
 import Test.QuickCheck
-import TestSupport (genOrder)
+import TestSupport (genOrder, genEngine)
 import Text.Blaze.Html5 (toHtml)
 import Text.Blaze.Html.Renderer.Utf8 (renderHtml)
 import TradingGame
@@ -90,6 +91,30 @@ prop_sseFraming value =
     , property ("\n\n" `B.isSuffixOf` wire)
     ]
 
+-- Generated names (including HTML metacharacters), secrets and trading results
+-- remain associated in the table; no result rows appear while trading.
+prop_settlementTable :: Property
+prop_settlementTable = forAll genEngine $ \engine ->
+  forAll (elements (players engine)) $ \player ->
+    let pid = playerID player
+        viewAt now = case handleRequest now pid GetExchangeState engine of
+          (current, Reply snapshot) -> renderHtml (exchangeView snapshot result)
+            where result = case snd (handleRequest now pid AwaitSettlement current) of
+                    Reply value -> Just value
+                    WhenResolved -> Nothing
+        -- Read the first table's rows as escaped text, independent of styling.
+        rows html = map (filter (not . T.null) . map (T.drop 1 . snd . T.breakOn ">") . T.splitOn "<")
+          (drop 1 (T.splitOn "<tr>" body))
+          where body = fst (T.breakOn "</tbody>" (snd (T.breakOn "<tbody>" (T.decodeUtf8 (LBS.toStrict html)))))
+        escaped = T.decodeUtf8 . LBS.toStrict . renderHtml . toHtml
+        expected =
+          [map escaped [displayName (settledPlayer entry), show (privateNumber (settledPlayer entry)), number (playerPayoff entry)]
+          | entry <- playerResults (settlementFor pid engine)]
+    in conjoin
+      [ rows (viewAt (closesAt (engineInfo engine))) === expected
+      , property (not ("Player results" `B.isInfixOf` LBS.toStrict (viewAt (opensAt (engineInfo engine)))))
+      ]
+
 -- Rejoining, with or without the original cookie, preserves an account after
 -- an arbitrary order; the cookie always selects the named existing player.
 prop_rejoin :: Property
@@ -136,4 +161,4 @@ prop_unknownPlayer = forAllShrink (arbitrary `suchThat` (`notElem` webPlayerName
       ]
 
 webProperties :: [Property]
-webProperties = [prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_rejoin, prop_unknownPlayer]
+webProperties = [prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer]

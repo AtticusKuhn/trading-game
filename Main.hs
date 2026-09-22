@@ -26,7 +26,13 @@ prop_settlementsSumToZero = checkCoverage $
         payoffs = map netPayoff settlements
     in cover 10 (any (/= 0) payoffs) "nonzero individual payoffs" $
        counterexample ("Settlements: " ++ show settlements) $
-         sum payoffs === 0
+         conjoin $ (sum payoffs === 0) :
+           [ conjoin
+               [ playerResults result === zipWith PlayerResult (map fst programs) payoffs
+               , resolvedSum result === sum (map (privateNumber . settledPlayer) (playerResults result))
+               ]
+           | result <- settlements
+           ]
 
 -- A lone player's self-trades cancel out, so their payoff is always zero.
 prop_singlePlayerSettlementIsZero :: Property

@@ -275,6 +275,13 @@ exchangeView snapshot settlement = do
     H.p ! A.class_ "text-sm text-slate-600" $ toHtml ("Closes: " ++ show (closesAt (gameInfo snapshot)))
     H.p ! A.class_ "text-sm text-slate-600" $ toHtml ("Last server update: " ++ show (observedAt snapshot))
     forM_ settlement $ \result -> H.p ! A.class_ "font-semibold" $ toHtml ("Your payoff: " ++ number (netPayoff result))
+  forM_ settlement $ \result -> panel $ do
+    H.h2 ! A.class_ "text-xl font-semibold" $ "Player results"
+    table ["Player", "Private number", "Payoff"] $
+      forM_ (playerResults result) $ \entry -> H.tr $ do
+        cell (displayName (settledPlayer entry))
+        cell (show (privateNumber (settledPlayer entry)))
+        cell (number (playerPayoff entry))
   H.div ! A.class_ "grid gap-6 md:grid-cols-2" $ do
     bookPanel Buy "Open buys · highest first"
     bookPanel Sell "Open sells · lowest first"

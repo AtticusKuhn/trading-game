@@ -127,4 +127,4 @@ prop_waitsAndSettlement (Positive delay) secret = liveProperty "session waits an
     takeMVar requested
     advance close
     result <- Async.wait caller
-    pure (result === Right (Settlement secret 0))
+    pure (result === Right (Settlement secret 0 [PlayerResult player 0]))

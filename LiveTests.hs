@@ -196,6 +196,8 @@ prop_concurrentPlayers scenario generated = liveProperty "concurrent programs, w
         void (submitOrder order { orderSide = Sell })
         void awaitSettlement
       -- Reverse ID order to check that settlements follow the input order.
+      results = [PlayerResult (testPlayer sellerId sellerSecret) (-payoff),
+                 PlayerResult (testPlayer buyerId buyerSecret) payoff]
       programs = [(testPlayer sellerId sellerSecret, seller), (testPlayer buyerId buyerSecret, buyer)]
       initial = newEngine start duration [testPlayer sellerId sellerSecret, testPlayer buyerId buyerSecret]
       config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
@@ -209,7 +211,8 @@ prop_concurrentPlayers scenario generated = liveProperty "concurrent programs, w
     final <- Async.wait game
     trace <- reverse <$> readTVarIO events
     pure $ conjoin
-      [ engineSettlements final === [Settlement total (-payoff), Settlement total payoff]
+      [ engineSettlements final ===
+          [Settlement total (-payoff) results, Settlement total payoff results]
       , counterexample "concurrent trace replay" (replay initial trace === Right final)
       , counterexample "one closure event" (length [() | ExchangeClosed _ <- trace] === 1)
       ]
@@ -220,6 +223,8 @@ prop_stopsAtClosure scenario (Positive overrun) = liveProperty "idle closure and
       start = scenarioStart scenario
       (_, _, duration) = scenarioTimes scenario
       total = toInteger firstSecret + toInteger secondSecret
+      results = [PlayerResult (testPlayer first firstSecret) 0,
+                 PlayerResult (testPlayer second secondSecret) 0]
   (clock, advance) <- manualClock start
   events <- newTVarIO []
   let sleeper = wait (duration + fromInteger overrun) >> error "live runner resumed a wait beyond closure"
@@ -228,7 +233,7 @@ prop_stopsAtClosure scenario (Positive overrun) = liveProperty "idle closure and
     awaitTrace events (hasWait first)
     advance (addUTCTime duration start)
     final <- Async.wait game
-    pure (final === [Settlement total 0, Settlement total 0])
+    pure (final === [Settlement total 0 results, Settlement total 0 results])
 
 -- All submissions compete for the same engine; no fills or updates may be lost.
 prop_concurrentOrders :: Scenario -> ValidOrder -> Positive Int -> Property
@@ -270,10 +275,12 @@ prop_settlementBroadcast scenario generated = liveProperty "shared settlement no
   events <- newTVarIO []
   runtime <- newLiveRuntime clock (record events) initial
   let close = closesAt (engineInfo initial)
+      results = [PlayerResult (testPlayer buyer buyerSecret) payoff,
+                 PlayerResult (testPlayer seller sellerSecret) (-payoff)]
       player pid side secret expected = (testPlayer pid secret, do
         void (submitOrder order { orderSide = side })
         result <- awaitSettlement
-        unless (result == Settlement total expected) (error "wrong shared settlement"))
+        unless (result == Settlement total expected results) (error "wrong shared settlement"))
       programs = [player buyer Buy buyerSecret payoff, player seller Sell sellerSecret (-payoff)]
   Async.withAsync (Async.mapConcurrently_ (runIO . runLivePlayer close runtime) programs) $ \workers -> do
     awaitTrace events (\trace -> all (`hasSettlementWait` trace) [buyer, seller])
@@ -354,4 +361,4 @@ prop_realClock = forAllShrink arbitrary shrink $ \(identifier, secret) ->
     liveProperty "real clock settlement" $ do
       result <- runIO $ runConcurrent $ runLiveFor (fromRational (micros % 1000000))
         [(testPlayer (PlayerId identifier) secret, void awaitSettlement)]
-      pure (result === [Settlement (toInteger secret) 0])
+      pure (result === [Settlement (toInteger secret) 0 [PlayerResult (testPlayer (PlayerId identifier) secret) 0]])

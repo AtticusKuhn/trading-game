@@ -14,7 +14,7 @@ import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 
 newtype PlayerId = PlayerId Integer deriving (Eq, Ord, Show)
 
--- Host-only identity: never include the roster in public exchange snapshots.
+-- Private during trading; revealed in settlement, never in exchange snapshots.
 data Player = Player
   { playerID :: PlayerId
   , displayName :: String
@@ -49,8 +49,8 @@ data GameInfo = GameInfo
   , closesAt :: UTCTime
   } deriving (Eq, Show)
 
--- The sum is public only once the game resolves; individual numbers remain
--- private even after resolution. Outstanding orders expire at the deadline.
+-- The sum and individual numbers are revealed only once the game resolves.
+-- Outstanding orders expire at the deadline.
 data GamePhase = Trading | Resolved Integer deriving (Eq, Show)
 
 -- Public order book entries contain the unfilled quantity, not private numbers.
@@ -85,10 +85,16 @@ data OrderError = GameClosed | InvalidQuantity deriving (Eq, Show)
 type OrderResult = Either OrderError OrderId
 
 -- One filled unit bought at price P pays S - P; a sale pays P - S.
--- Unfilled orders have no payoff. This result belongs only to the caller.
+-- Unfilled orders have no payoff. Every caller sees the complete final roster.
+data PlayerResult = PlayerResult
+  { settledPlayer :: Player
+  , playerPayoff :: Rational
+  } deriving (Eq, Show)
+
 data Settlement = Settlement
   { resolvedSum :: Integer
   , netPayoff :: Rational
+  , playerResults :: [PlayerResult]
   } deriving (Eq, Show)
 
 data TradingGame :: Effect where
@@ -172,7 +178,7 @@ engineTotal = sum . map privateNumber . players
 
 engineSettlements :: Engine -> [Settlement]
 engineSettlements engine =
-  [settlementFor (engineTotal engine) (playerID player) (engineBook engine)
+  [settlementFor (playerID player) engine
   | player <- players engine]
 
 advanceTo :: UTCTime -> Engine -> Engine
@@ -215,13 +221,21 @@ handleRequest now pid request initial =
     Wait seconds -> (engine, ResumeAt (addUTCTime (max 0 seconds) now))
     WaitUntil target -> (engine, ResumeAt (max now target))
     AwaitSettlement -> case enginePhase engine of
-      Resolved value -> answer (settlementFor value pid state)
+      Resolved _ -> answer (settlementFor pid engine)
       Trading -> (engine, WhenResolved)
 
-settlementFor :: Integer -> PlayerId -> Exchange -> Settlement
-settlementFor total pid state =
-  let (units, cash) = maybe (0, 0) id (lookup pid (accounts state))
-  in Settlement total (cash + fromInteger (units * total))
+-- Host-only helper; interpreters call this after resolution.
+settlementFor :: PlayerId -> Engine -> Settlement
+settlementFor pid engine = Settlement
+  { resolvedSum = total
+  , netPayoff = payoff pid
+  , playerResults = [PlayerResult player (payoff (playerID player)) | player <- players engine]
+  }
+  where
+    total = engineTotal engine
+    payoff who =
+      let (units, cash) = maybe (0, 0) id (lookup who (accounts (engineBook engine)))
+      in cash + fromInteger (units * total)
 
 -- Match against the best eligible price, then the oldest order at that price.
 -- An incoming order's remainder rests until matched or the game closes.

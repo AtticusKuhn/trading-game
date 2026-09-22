@@ -128,7 +128,7 @@ runWithCurrentPlayer runtime action = do
               clockAlarm (runtimeClock runtime) target >>= atomically
             WhenResolved -> do
               final <- liftIO (runExchange runtime)
-              pure (settlementFor (engineTotal final) pid (engineBook final))) action
+              pure (settlementFor pid final)) action
 
 runLivePlayer :: IOE :< effs => UTCTime -> LiveRuntime -> PlayerProgram effs -> Eff effs ()
 runLivePlayer close runtime (player, program) = loop program
@@ -152,7 +152,7 @@ runLivePlayer close runtime (player, program) = loop program
                   when awake (loop (resume ()))
             WhenResolved -> do
               final <- liftIO (atomically finished)
-              loop (resume (settlementFor (engineTotal final) pid (engineBook final)))
+              loop (resume (settlementFor pid final))
 
 runLive :: (IOE :< effs, Concurrent :< effs) => [PlayerProgram effs] -> Eff effs [Settlement]
 runLive = runLiveFor 3600

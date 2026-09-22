@@ -28,7 +28,11 @@ live = runIO (runConcurrent (runLiveFor 10 programs))
 
 `runTradingGame` and `runLive` use the default one-hour duration. All settlement
 lists follow the input player order. Supply at least one player, with unique IDs and nonblank, unique display names.
-Nonpositive durations close immediately.
+Nonpositive durations close immediately. Each `Settlement` retains the caller's
+`netPayoff` and includes `playerResults :: [PlayerResult]` in roster order. Each
+result contains `settledPlayer :: Player` (ID, name, and private number) and
+`playerPayoff :: Rational`, including players who never traded. These details
+are revealed only after resolution.
 
 ## Web debugging prototype
 
@@ -40,8 +44,9 @@ nix run path:.#web -- 3000 60
 
 Open `http://127.0.0.1:3000`, select a player, and place buy or sell limit orders.
 The page shows your private number, open buys and sells, the latest twenty
-trades, and your payoff at settlement. Prices accept integers, exact decimals,
-and fractions. An accepted order can remain open until another order matches.
+trades, and a settlement table with every player's private number and payoff.
+Prices accept integers, exact decimals, and fractions. An accepted order can
+remain open until another order matches.
 
 The roster is fixed at startup by `webPlayerNames` in `TradingGame.Web`:
 `alice`, `bob`, `carol`, `dan`, `eve`, `fred`, `gwen`, `hal`, `market-maker`, and
@@ -110,7 +115,8 @@ quit
 Prices and seconds accept integers, exact decimals, and fractions such as `3/2`.
 Quantities must be positive integers. Invalid input prints an error and retries;
 EOF acts as `quit`. `logout` returns to the session prompt; `quit` exits the
-terminal. `settlement` waits for closure and prints the current player's payoff.
+terminal. `settlement` waits for closure and prints the resolved sum, your payoff,
+and every player's private number and payoff.
 The live exchange closes at its deadline even while the terminal is waiting for
 input; the terminal remains available to inspect the resolved game until quit.
 
@@ -121,7 +127,7 @@ maker. General multi-program simulations use the event-queue `runTradingGame`.
 
 ## Players and sessions
 
-`Player` is a host-only record containing `playerID :: PlayerId`,
+`Player` is a record kept private until settlement, containing `playerID :: PlayerId`,
 `displayName :: String`, and `privateNumber :: Integer`. `newEngine` accepts a
 fixed `[Player]`, stored as `players`; trading and session changes preserve it.
 Public exchange snapshots do not include the roster or other players' secrets.
@@ -253,7 +259,8 @@ for ordinary live runs.
 `TradingGame` re-exports these modules, `Interaction`, `Session`, and `Concurrent`. The engine,
 low-level runtime API, and trace hook are host-only. Interaction replies expose
 only the caller's private number, public snapshots, order results, and the
-caller's settlement.
+caller's settlement, which reveals all players' private numbers and payoffs
+after closure.
 
 An order's authoritative time is sampled after acquiring the engine lock.
 Orders processed at or after closure cannot trade, including callers that started

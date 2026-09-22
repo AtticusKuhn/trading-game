@@ -126,6 +126,9 @@ renderInfo info = case info of
   OrderSubmitted (Left problem) -> "Order rejected: " ++ show problem
   PlayerSettlement result -> "Resolved sum: " ++ show (resolvedSum result)
     ++ "; your payoff: " ++ renderRational (netPayoff result)
+    ++ concatMap (\entry -> "\n" ++ displayName (settledPlayer entry)
+      ++ "; private number: " ++ show (privateNumber (settledPlayer entry))
+      ++ "; payoff: " ++ renderRational (playerPayoff entry)) (playerResults result)
   HelpInfo -> commandHelp
   where
     renderRational n | denominator n == 1 = show (numerator n)

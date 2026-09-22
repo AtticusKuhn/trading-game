@@ -56,7 +56,7 @@ prop_simulationInteraction secret (Positive delay) =
         snapshot now engine = case snd (handleRequest now pid GetExchangeState engine) of
           Reply value -> ExchangeSnapshot value
         later = addUTCTime (fromInteger delay) simulationStart
-        result = Settlement (toInteger secret) 0
+        result = Settlement (toInteger secret) 0 [PlayerResult (testPlayer pid secret) 0]
         unread = [Help]
         commands = [ShowPrivateNumber] ++ map PlaceOrder orders ++
           [ShowExchange, WaitFor (fromInteger delay), ShowExchange, ShowSettlement,
@@ -98,7 +98,7 @@ prop_liveScopeInteraction secret = liveProperty "outer interaction handler in li
     takeMVar delivered
     advance (addUTCTime 60 simulationStart)
     result <- Async.wait game
-    pure (result === (([Help], [PrivateNumber (toInteger secret)]), [Settlement (toInteger secret) 0]))
+    pure (result === (([Help], [PrivateNumber (toInteger secret)]), [Settlement (toInteger secret) 0 [PlayerResult (testPlayer (PlayerId 42) secret) 0]]))
 
 prop_parsePrices :: Integer -> Positive Integer -> Positive Integer -> Property
 prop_parsePrices n (Positive d) (Positive quantity) =

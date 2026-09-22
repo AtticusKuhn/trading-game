@@ -17,6 +17,7 @@ engineProperties =
   , prop_closure
   , prop_invalidOrder
   , prop_waits
+  , prop_settlementDisclosure
   ]
 
 prop_conservation :: Property
@@ -58,6 +59,25 @@ prop_closure = forAll genEngine $ \engine ->
           , orderBook = []
           , tradeHistory = reverse (executedTrades (engineBook engine))
           }
+      ]
+
+-- A settlement request reveals nothing before the deadline and the full roster
+-- afterwards, including inactive players and the caller's own result.
+prop_settlementDisclosure :: Property
+prop_settlementDisclosure = forAll genEngine $ \engine ->
+  forAll (elements (players engine)) $ \player ->
+    let pid = playerID player
+        requestAt now = snd (handleRequest now pid AwaitSettlement engine)
+    in conjoin
+      [ requestAt (opensAt (engineInfo engine)) === WhenResolved
+      , case requestAt (closesAt (engineInfo engine)) of
+          Reply result -> conjoin
+            [ map settledPlayer (playerResults result) === players engine
+            , [playerPayoff entry | entry <- playerResults result, settledPlayer entry == player]
+                === [netPayoff result]
+            , sum (map playerPayoff (playerResults result)) === 0
+            ]
+          _ -> counterexample "Settlement unavailable at closure" False
       ]
 
 prop_invalidOrder :: Property
