@@ -6,6 +6,7 @@ module TradingGame
   , module TradingGame.Concurrent
   , module TradingGame.Interaction
   , module TradingGame.Live
+  , module TradingGame.ManageGames
   , module TradingGame.Session
   ) where
 
@@ -15,4 +16,5 @@ import TradingGame.Core
 import TradingGame.Live
 import TradingGame.Player
 import TradingGame.Simulation
+import TradingGame.ManageGames
 import TradingGame.Session

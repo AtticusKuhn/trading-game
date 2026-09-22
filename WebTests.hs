@@ -1,7 +1,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module WebTests (webProperties) where
+module WebTests (webProperties, post, orderFields) where
 
 import Control.Concurrent.Async (mapConcurrently)
 import qualified Control.Concurrent.Async as Async
@@ -13,6 +13,8 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.Either (isRight)
 import Data.List (find, nub, sort)
 import Control.Monad (void)
+import Data.Time.Clock (NominalDiffTime)
+import System.Random (randomRIO)
 import Data.Maybe (isJust)
 import LiveTests (liveProperty, manualClock)
 import qualified Data.Map.Strict as Map
@@ -27,6 +29,21 @@ import Text.Blaze.Html5 (toHtml)
 import Text.Blaze.Html.Renderer.Utf8 (renderHtml)
 import TradingGame
 import TradingGame.Web
+
+-- Player identities are fixed; only their private numbers are drawn at startup.
+webPlayerNames :: [String]
+webPlayerNames =
+  ["alice", "bob", "carol", "dan", "eve", "fred", "gwen", "hal", "market-maker", "noise-trader"]
+
+newWebGame :: NominalDiffTime -> IO WebGame
+newWebGame duration = do
+  clock <- newLiveClock
+  start <- clockNow clock
+  roster <- sequence
+    [Player (PlayerId n) name <$> randomRIO (1, 9) | (n, name) <- zip [1..] webPlayerNames]
+  runtime <- newLiveRuntime clock (const (pure ())) (newEngine start duration roster)
+  sessions <- newTVarIO Map.empty
+  pure (WebGame runtime sessions roster [])
 
 post :: B.ByteString -> RequestHeaders -> [(B.ByteString, B.ByteString)] -> SRequest
 post path headers fields = SRequest

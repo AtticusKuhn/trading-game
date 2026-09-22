@@ -18,4 +18,4 @@ main = do
       (Just p, Just duration) | p > 0 && p <= 65535 && duration > 0 && duration <= 86400 ->
         runWebServer p (fromInteger duration)
       _ -> die usage
-    usage = "Usage: trading-game-web [PORT (1–65535)] [SECONDS (1–86400, default 3600)]"
+    usage = "Usage: trading-game-web [PORT (1–65535)] [SUGGESTED_SECONDS (1–86400, default 3600)]"

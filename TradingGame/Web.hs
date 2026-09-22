@@ -9,10 +9,10 @@
 module TradingGame.Web where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.MVar (newMVar, withMVar)
+import Control.Concurrent.MVar (newMVar, withMVar, readMVar)
 import Control.Concurrent.STM
-import Control.Effect (Eff, IOE, (:<), interpret, liftIO, runIO)
-import Control.Monad (forM_, forever, void, when)
+import Control.Effect (Eff, IOE, interpret, liftIO, runIO)
+import Control.Monad (forM_, forever, void)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B
 import Data.ByteString.Builder (Builder, byteString)
@@ -23,13 +23,14 @@ import qualified Data.Map.Strict as Map
 import Data.Ratio (denominator, numerator)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
-import Data.Time.Clock (NominalDiffTime)
+import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime)
+import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+import Text.Read (readMaybe)
 import Network.HTTP.Types
 import Network.Wai
 import qualified Network.Wai.Handler.Warp as Warp
 import Numeric (showHex)
 import System.Entropy (getEntropy)
-import System.Random (randomRIO)
 import Text.Blaze.Html5 (Html, (!), toHtml, customAttribute)
 import qualified Text.Blaze.Html5 as H
 import qualified Text.Blaze.Html5.Attributes as A
@@ -48,21 +49,6 @@ data WebGame = WebGame
   , webPlayers :: [Player]
   , webBots :: [Player]
   }
-
--- Player identities are fixed; only their private numbers are drawn at startup.
-webPlayerNames :: [String]
-webPlayerNames =
-  ["alice", "bob", "carol", "dan", "eve", "fred", "gwen", "hal", "market-maker", "noise-trader"]
-
-newWebGame :: NominalDiffTime -> IO WebGame
-newWebGame duration = do
-  clock <- newLiveClock
-  start <- clockNow clock
-  roster <- sequence
-    [Player (PlayerId n) name <$> randomRIO (1, 9) | (n, name) <- zip [1..] webPlayerNames]
-  runtime <- newLiveRuntime clock (const (pure ())) (newEngine start duration roster)
-  sessions <- newTVarIO Map.empty
-  pure (WebGame runtime sessions roster (drop 8 roster))
 
 -- Each HTTP request reinstalls the existing session and trading interpreters.
 -- Identity always comes from the server's cookie table, never form fields.
@@ -107,7 +93,7 @@ lookupSession game request = do
 -- Joining creates only a browser session, never a player or a new account.
 -- Exact names match the terminal's PlayerSession semantics, including rejoins.
 joinWebPlayer :: WebGame -> T.Text -> IO (Either T.Text BS.ByteString)
-joinWebPlayer game name = case find ((== T.unpack name) . displayName) (webPlayers game) of
+joinWebPlayer game name = case find ((== T.unpack name) . displayName) (humanPlayers game) of
   Nothing -> pure (Left "Unknown player. Choose a player from this game's roster.")
   Just player -> do
     bytes <- getEntropy 32
@@ -143,17 +129,23 @@ htmlResponse status headers html = responseLBS status
   ([(hContentType, "text/html; charset=utf-8"), (hCacheControl, "no-store")] ++ headers) (renderHtml html)
 
 webApplication :: WebGame -> Application
-webApplication game request respond = do
+webApplication = gameApplication ""
+
+gameApplication :: T.Text -> WebGame -> Application
+gameApplication base game request respond = do
   session <- lookupSession game request
-  let page content = respond (htmlResponse status200 [] (document content))
+  let page content = respond (htmlResponse status200 [] (document $ do
+        H.p ! A.class_ "text-sm font-semibold text-slate-600" $
+          toHtml (if T.null base then "" else "Game " <> T.takeWhileEnd (/= '/') base)
+        content))
       feedback message = respond (htmlResponse status200 [] (H.p ! A.role "status" $ toHtml message))
-      redirect headers = respond (htmlResponse status303 ((hLocation, "/"):headers) mempty)
+      redirect headers = respond (htmlResponse status303 ((hLocation, T.encodeUtf8 (base <> "/")):headers) mempty)
   case (requestMethod request, pathInfo request) of
     ("GET", []) -> case session of
-      Nothing -> page (joinView (webPlayers game) Nothing)
+      Nothing -> page (joinView base (humanPlayers game) Nothing)
       Just current -> do
         (secret, snapshot, settlement) <- playerSnapshot game current
-        page (gameView current secret snapshot settlement)
+        page (gameView base current secret snapshot settlement)
     ("POST", ["join"]) -> do
       form <- readForm request
       result <- case form of
@@ -162,10 +154,10 @@ webApplication game request respond = do
           Nothing -> pure (Left "Enter a valid player name.")
           Just name -> joinWebPlayer game name
       case result of
-        Left problem -> respond (htmlResponse status400 [] (document (joinView (webPlayers game) (Just problem))))
-        Right token -> redirect [("Set-Cookie", "trading-session=" <> token <> "; Path=/; HttpOnly; SameSite=Strict")]
+        Left problem -> respond (htmlResponse status400 [] (document (joinView base (humanPlayers game) (Just problem))))
+        Right token -> redirect [("Set-Cookie", "trading-session=" <> token <> "; Path=" <> T.encodeUtf8 (base <> "/") <> "; HttpOnly; SameSite=Strict")]
     ("POST", ["orders"]) -> case session of
-      Nothing -> respond (htmlResponse status401 [("HX-Redirect", "/")] (H.p "Join as a player first."))
+      Nothing -> respond (htmlResponse status401 [("HX-Redirect", T.encodeUtf8 (base <> "/"))] (H.p "Join as a player first."))
       Just current -> do
         form <- readForm request
         case form >>= parseOrderForm of
@@ -259,24 +251,26 @@ document content = H.docTypeHtml ! A.lang "en" $ do
     H.header $ do
       H.p ! A.class_ "text-sm font-semibold uppercase tracking-widest text-indigo-600" $ "Local debugging exchange"
       H.h1 ! A.class_ "text-3xl font-bold" $ "Trading Game"
-      H.p ! A.class_ "mt-2 text-slate-600" $ "Trade contracts on the sum of ten private numbers. Each number is between 1 and 9."
+      H.p ! A.class_ "mt-2 text-slate-600" $ "Trade contracts on the sum of the players’ private numbers. Each number is between 1 and 9."
+      H.a ! A.href "/" ! A.class_ "text-indigo-700 underline" $ "All games"
     content
-    H.footer ! A.class_ "text-sm text-slate-500" $ "In-memory demo · 8 human players + 2 trading bots · Restart the server to reset."
+    H.footer ! A.class_ "text-sm text-slate-500" $ "In-memory demo · Restart the server to reset."
 
-joinView :: [Player] -> Maybe T.Text -> Html
-joinView roster problem = panel $ do
+joinView :: T.Text -> [Player] -> Maybe T.Text -> Html
+joinView _ [] _ = panel (H.p "This roster contains only bots; there are no human accounts to join.")
+joinView base roster problem = panel $ do
   H.h2 ! A.class_ "text-xl font-semibold" $ "Join as a player"
   H.p "Choose an existing player. Rejoining from any browser returns to the same private number, orders, and account."
-  H.p ! A.class_ "text-sm text-slate-600" $ "All ten private numbers are fixed at server startup; every player counts toward the sum, even before joining. The clock starts when the server starts."
+  H.p ! A.class_ "text-sm text-slate-600" $ "The roster and private numbers were fixed when this game was created. Every player counts toward the sum, even before joining."
   forM_ problem $ \message -> H.p ! A.role "alert" ! A.class_ "text-red-700" $ toHtml message
-  H.form ! A.method "post" ! A.action "/join" ! A.class_ "max-w-sm space-y-3" $ do
+  H.form ! A.method "post" ! A.action (H.toValue (base <> "/join")) ! A.class_ "max-w-sm space-y-3" $ do
     H.label ! A.for "name" ! A.class_ "block" $ "Player name"
     H.select ! A.id "name" ! A.name "name" ! A.required "" ! A.class_ inputClass $
       forM_ roster $ \player -> H.option ! A.value (H.toValue (displayName player)) $ toHtml (displayName player)
     H.button ! A.type_ "submit" ! A.class_ "rounded bg-indigo-700 px-4 py-2 font-semibold text-white" $ "Join game"
 
-gameView :: BrowserSession -> Integer -> ExchangeState -> Maybe Settlement -> Html
-gameView session secret snapshot settlement = do
+gameView :: T.Text -> BrowserSession -> Integer -> ExchangeState -> Maybe Settlement -> Html
+gameView base session secret snapshot settlement = do
   panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ toHtml ("Playing as " ++ displayName (sessionPlayer session))
     H.p $ do
@@ -284,7 +278,7 @@ gameView session secret snapshot settlement = do
       H.strong ! A.class_ "font-mono text-2xl text-indigo-700" $ toHtml (show secret)
   panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ "New limit order"
-    H.form ! A.method "post" ! A.action "/orders" ! attr "hx-post" "/orders" ! attr "hx-target" "#order-result"
+    H.form ! A.method "post" ! A.action (H.toValue (base <> "/orders")) ! attr "hx-post" (H.toValue (base <> "/orders")) ! attr "hx-target" "#order-result"
       ! attr "hx-disabled-elt" "find button" ! A.class_ "grid gap-4 sm:grid-cols-4 sm:items-end" $ do
       H.label $ do
         "Side"
@@ -300,7 +294,7 @@ gameView session secret snapshot settlement = do
       H.button ! A.type_ "submit" ! A.class_ "rounded bg-indigo-700 px-4 py-2 font-semibold text-white disabled:opacity-50" $ "Place order"
     H.p ! A.class_ "text-sm text-slate-600" $ "Prices accept integers, decimals, and fractions. A buy is your maximum price; a sell is your minimum."
     H.div ! A.id "order-result" ! attr "aria-live" "polite" $ mempty
-  H.div ! attr "hx-ext" "sse" ! attr "sse-connect" "/events" ! attr "sse-close" "closed" $
+  H.div ! attr "hx-ext" "sse" ! attr "sse-connect" (H.toValue (base <> "/events")) ! attr "sse-close" "closed" $
     H.div ! A.id "exchange" ! attr "sse-swap" "exchange" ! A.class_ "space-y-6" $ exchangeView snapshot settlement
 
 exchangeView :: ExchangeState -> Maybe Settlement -> Html
@@ -324,7 +318,7 @@ exchangeView snapshot settlement = do
     bookPanel Sell "Open sells · lowest first"
   panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ "Recent trades"
-    if null (tradeHistory snapshot) then H.p "No trades yet. The bots trade every few seconds."
+    if null (tradeHistory snapshot) then H.p "No trades yet."
     else table ["Time (UTC)", "Price", "Quantity"] $
       forM_ (take 20 (reverse (tradeHistory snapshot))) $ \trade -> H.tr $ do
         cell (show (tradedAt trade))
@@ -358,43 +352,221 @@ number value | denominator value == 1 = show (numerator value)
 priceText :: Price -> String
 priceText (Price value) = number value
 
--- Both bots use only TradingGame effects. One maintains a small two-sided
--- book; the other crosses its best quotes, so a fresh demo visibly trades.
-marketMaker :: TradingGame :< effs => Eff effs ()
-marketMaker = do
-  secret <- getMyPrivateNumber
-  let bid = Price (fromInteger (secret + 9 * 5 - 2))
-      ask = Price (fromInteger (secret + 9 * 5 + 2))
-      loop = do
-        snapshot <- getExchangeState
-        when (gamePhase snapshot == Trading) $ do
-          when (not (any ((== Buy) . restingSide) (orderBook snapshot))) $ void (submitOrder (LimitOrder Buy bid 5))
-          when (not (any ((== Sell) . restingSide) (orderBook snapshot))) $ void (submitOrder (LimitOrder Sell ask 5))
-          wait 2
-          loop
-  loop
+-- Browser tokens live in a separate table for each game, even when names match.
+data WebLobby = WebLobby
+  { lobbyManager :: GameManager
+  , lobbySessions :: TVar (Map.Map GameId (TVar (Map.Map BS.ByteString BrowserSession)))
+  , lobbyDuration :: NominalDiffTime
+  }
 
-noiseTrader :: TradingGame :< effs => Eff effs ()
-noiseTrader = loop Buy
+newWebLobby :: GameManager -> NominalDiffTime -> IO WebLobby
+newWebLobby manager duration = WebLobby manager <$> newTVarIO Map.empty <*> pure duration
+
+humanPlayers :: WebGame -> [Player]
+humanPlayers game = filter (\player -> playerID player `notElem` map playerID (webBots game)) (webPlayers game)
+
+managedWebGame :: WebLobby -> GameSummary -> IO (Maybe WebGame)
+managedWebGame lobby summary = do
+  active <- gameRuntime (lobbyManager lobby) (summaryId summary)
+  case active of
+    Nothing -> pure Nothing
+    Just runtime -> do
+      roster <- players <$> readMVar (runtimeEngine runtime)
+      sessions <- atomically $ do
+        tables <- readTVar (lobbySessions lobby)
+        case Map.lookup (summaryId summary) tables of
+          Just existing -> pure existing
+          Nothing -> do
+            fresh <- newTVar Map.empty
+            writeTVar (lobbySessions lobby) (Map.insert (summaryId summary) fresh tables)
+            pure fresh
+      let bots = [player | (player, entry) <- zip roster (gameRoster (summaryConfig summary))
+                         , rosterType entry /= HumanPlayer]
+      pure (Just (WebGame runtime sessions roster bots))
+
+gamePath :: GameId -> T.Text
+gamePath (GameId gid) = "/games/" <> T.pack (show gid)
+
+lobbyApplication :: WebLobby -> Application
+lobbyApplication lobby request respond = do
+  let manager = lobbyManager lobby
+      manage :: Eff '[ManageGames, IOE] a -> IO a
+      manage action = runIO (runManageGames manager action)
+      page status body = respond (htmlResponse status [] (document body))
+      notFound = page status404 (H.p "Game not found.")
+  case (requestMethod request, pathInfo request) of
+    ("GET", []) -> do
+      summaries <- manage listAllGames
+      now <- getCurrentTime
+      let stamp :: UTCTime -> BS.ByteString
+          stamp = B.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S"
+      page status200 $ do
+        H.div ! attr "hx-ext" "sse" ! attr "sse-connect" "/games/events" $
+          H.div ! attr "sse-swap" "games" $ gamesView summaries
+        creationView (lobbyDuration lobby) [("start", stamp now), ("end", stamp (addUTCTime (lobbyDuration lobby) now))] Nothing
+    ("GET", ["roster-row"]) -> respond (htmlResponse status200 [] (rosterRow "" "human"))
+    ("POST", ["games"]) -> do
+      form <- readForm request
+      result <- case form >>= parseNewGameForm of
+        Left problem -> pure (Left problem)
+        Right config -> either (Left . creationError) Right <$> manage (createNewGame config)
+      case result of
+        Right gid -> respond (htmlResponse status303 [(hLocation, T.encodeUtf8 (gamePath gid <> "/"))] mempty)
+        Left problem -> page status400 (creationView (lobbyDuration lobby) (either (const []) id form) (Just problem))
+    ("GET", ["games", "events"]) -> respond $ directoryStream manager $ do
+      summaries <- manage listAllGames
+      pure ("games", gamesView summaries, False)
+    (_, "games":rawId:rest) -> case readMaybe (T.unpack rawId) of
+      Nothing -> notFound
+      Just ident -> do
+        found <- manage (lookupGame (GameId ident))
+        case found of
+          Nothing -> notFound
+          Just summary -> do
+            let base = gamePath (summaryId summary)
+            case (requestMethod request, filter (not . T.null) rest) of
+              ("GET", ["status"]) -> respond $ directoryStream manager $ do
+                current <- manage (lookupGame (summaryId summary))
+                pure ("availability", maybe (H.p "Game not found.") availabilityView current,
+                      maybe True ((/= Upcoming) . summaryStatus) current)
+              _ -> do
+                game <- managedWebGame lobby summary
+                case game of
+                  Just active -> gameApplication base active
+                    request { pathInfo = filter (not . T.null) rest } respond
+                  Nothing -> case (requestMethod request, filter (not . T.null) rest) of
+                    ("GET", []) -> page status200 $
+                      H.div ! attr "hx-ext" "sse" ! attr "sse-connect" (H.toValue (base <> "/status"))
+                        ! attr "sse-close" "closed" $
+                        H.div ! attr "sse-swap" "availability" $ availabilityView summary
+                    _ -> page status409 (H.p "This game is not available to join or trade yet.")
+    _ -> notFound
+
+-- An STM revision wakes streams on creation, start, completion, or failure.
+-- Read it before rendering so no concurrent update can be lost.
+directoryStream :: GameManager -> IO (BS.ByteString, Html, Bool) -> Response
+directoryStream manager snapshot = responseStream status200
+  [(hContentType, "text/event-stream"), (hCacheControl, "no-cache, no-store"), ("X-Accel-Buffering", "no")] $ \send flush -> do
+    lock <- newMVar ()
+    let write chunk = withMVar lock (\() -> send chunk >> flush)
+        loop = do
+          revision <- readTVarIO (gameRevision manager)
+          (event, html, finished) <- snapshot
+          write (sseHtml event html)
+          if finished then write "event: closed\ndata: done\n\n" else do
+            atomically (readTVar (gameRevision manager) >>= check . (/= revision))
+            loop
+        heartbeat = forever (threadDelay 15000000 >> write ": keep-alive\n\n")
+    runIO $ runConcurrent $ withWorkers [liftIO heartbeat] (liftIO loop)
+
+gamesView :: [GameSummary] -> Html
+gamesView summaries = panel $ do
+  H.h2 ! A.class_ "text-xl font-semibold" $ "All games"
+  if null summaries then H.p "No games yet. Create the first game below."
+  else table ["Game", "Status", "Starts (UTC)", "Ends (UTC)", "Players"] $
+    forM_ summaries $ \summary -> H.tr $ do
+      let GameId gid = summaryId summary
+          config = summaryConfig summary
+      H.td ! A.class_ "py-2 pr-4" $ H.a ! A.href (H.toValue (gamePath (summaryId summary) <> "/"))
+        ! A.class_ "text-indigo-700 underline" $ toHtml ("Game " ++ show gid)
+      cell (statusLabel (summaryStatus summary))
+      cell (show (gameStart config))
+      cell (show (gameEnd config))
+      cell (show (length (gameRoster config)))
+
+statusLabel :: GameStatus -> String
+statusLabel Upcoming = "Upcoming"
+statusLabel Running = "Running"
+statusLabel Completed = "Completed"
+statusLabel Failed = "Unavailable"
+
+availabilityView :: GameSummary -> Html
+availabilityView summary = do
+  panel $ do
+    H.h2 ! A.class_ "text-xl font-semibold" $ toHtml (statusLabel (summaryStatus summary))
+    H.p $ toHtml ("Starts: " ++ show (gameStart config) ++ " · Ends: " ++ show (gameEnd config))
+    H.ul $ forM_ (gameRoster config) $ \entry ->
+      H.li $ toHtml (rosterName entry ++ " · " ++ playerTypeLabel (rosterType entry))
+  case summaryStatus summary of
+    Upcoming -> panel (H.p "Joining opens at the start time. This page updates automatically.")
+    Failed -> panel (H.p "The game could not run.")
+    _ -> joinView (gamePath (summaryId summary))
+      [Player (PlayerId n) (rosterName entry) 0 | (n, entry) <- zip [1..] (gameRoster config)
+                                            , rosterType entry == HumanPlayer] Nothing
+  where config = summaryConfig summary
+
+playerTypeLabel :: PlayerType -> String
+playerTypeLabel HumanPlayer = "Human"
+playerTypeLabel RandomTradingBot = "Random trading bot"
+playerTypeLabel MarketMakingBot = "Market-making bot"
+
+creationError :: CreateGameError -> String
+creationError InvalidTimeWindow = "End time must be later than start time."
+creationError EmptyRoster = "Add at least one player."
+creationError BlankPlayerName = "Every player needs a name."
+creationError DuplicatePlayerNames = "Player names must be unique within this game."
+creationError ManagerClosed = "The server is shutting down."
+
+-- UTC is explicit: datetime-local values have no browser timezone attached.
+parseNewGameForm :: [(BS.ByteString, BS.ByteString)] -> Either String NewGameConfig
+parseNewGameForm fields = do
+  start <- timestamp "start"
+  end <- timestamp "end"
+  names <- traverse decode [value | (key, value) <- fields, key == "player-name"]
+  types <- traverse parseType [value | (key, value) <- fields, key == "player-type"]
+  if length names /= length types then Left "Every roster row needs a name and player type."
+  else pure (NewGameConfig start end [RosterEntry (T.unpack name) kind
+        | (name, kind) <- zip names types, not (T.null name)])
   where
-    loop side = do
-      wait 3
-      snapshot <- getExchangeState
-      when (gamePhase snapshot == Trading) $ do
-        let opposite = filter ((/= side) . restingSide) (orderBook snapshot)
-            quotes = sortOn restingPrice opposite
-            best = if side == Buy then quotes else reverse quotes
-        forM_ (take 1 best) $ \entry -> void (submitOrder (LimitOrder side (restingPrice entry) 1))
-        loop (if side == Buy then Sell else Buy)
+    decode value = either (const (Left "Use valid UTF-8 player names.")) Right (T.decodeUtf8' value)
+    timestamp key = case lookup key fields >>= parseTimestamp . B.unpack of
+      Nothing -> Left "Enter start and end times in UTC."
+      Just value -> Right value
+    parseTimestamp value = case parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%S" value of
+      Just time -> Just time
+      Nothing -> parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M" value
+    parseType "human" = Right HumanPlayer
+    parseType "random" = Right RandomTradingBot
+    parseType "maker" = Right MarketMakingBot
+    parseType _ = Left "Choose a supported player type."
+
+creationView :: NominalDiffTime -> [(BS.ByteString, BS.ByteString)] -> Maybe String -> Html
+creationView duration fields problem = panel $ do
+  H.h2 ! A.class_ "text-xl font-semibold" $ "Create a game"
+  H.p "Choose a time window in UTC. Past start times begin immediately; an elapsed window settles immediately."
+  H.p "Private numbers are drawn by the server. The roster cannot change after creation."
+  forM_ problem $ \message -> H.p ! A.role "alert" ! A.class_ "text-red-700" $ toHtml message
+  H.form ! A.method "post" ! A.action "/games" ! A.class_ "space-y-4" $ do
+    forM_ [("start", "Starts (UTC)"), ("end", "Ends (UTC)")] $ \(key, label) -> H.label ! A.class_ "block" $ do
+      toHtml (label :: String)
+      H.input ! A.type_ "datetime-local" ! A.name (H.toValue (B.unpack key)) ! A.required "" ! A.step "1"
+        ! A.value (H.toValue (B.unpack (maybe "" id (lookup key fields)))) ! A.class_ inputClass
+    H.p ! A.class_ "text-sm text-slate-600" $ toHtml ("Suggested duration: " ++ show duration ++ ". All times are UTC.")
+    H.div ! A.id "roster" ! A.class_ "space-y-3" $ do
+      H.p "Players (leave unused rows blank)"
+      let names = [value | (key, value) <- fields, key == "player-name"]
+          types = [value | (key, value) <- fields, key == "player-type"]
+          rows = if null names then [("alice", "human"), ("bob", "human"), ("market-maker", "maker"), ("random-trader", "random")]
+                 else zip names types
+      forM_ (rows ++ replicate 4 ("", "human")) $ \(name, kind) -> rosterRow name kind
+    H.button ! A.type_ "button" ! attr "hx-get" "/roster-row" ! attr "hx-target" "#roster" ! attr "hx-swap" "beforeend"
+      ! A.class_ "rounded border px-4 py-2" $ "Add player row"
+    H.button ! A.type_ "submit" ! A.class_ "rounded bg-indigo-700 px-4 py-2 font-semibold text-white" $ "Create game"
+
+rosterRow :: BS.ByteString -> BS.ByteString -> Html
+rosterRow name kind = H.div ! A.class_ "grid gap-3 sm:grid-cols-2" $ do
+  H.input ! A.name "player-name" ! A.type_ "text" ! A.placeholder "Player name" ! A.maxlength "100"
+    ! attr "aria-label" "Player name" ! A.value (H.toValue (T.decodeUtf8With (\_ _ -> Just '\xfffd') name)) ! A.class_ inputClass
+  H.select ! A.name "player-type" ! attr "aria-label" "Player type" ! A.class_ inputClass $
+    forM_ [("human", HumanPlayer), ("random", RandomTradingBot), ("maker", MarketMakingBot)] $ \(value, playerType) ->
+      (if kind == value then (! A.selected "") else id)
+        (H.option ! A.value (H.toValue (B.unpack value))) $ toHtml (playerTypeLabel playerType)
 
 runWebServer :: Int -> NominalDiffTime -> IO ()
 runWebServer port duration = do
-  game <- newWebGame duration
-  let botActions = zipWith (\player program -> liftIO (asPlayer game (BrowserSession player) program))
-        (webBots game) [marketMaker, noiseTrader]
-      settings = Warp.setHost "127.0.0.1" $ Warp.setPort port $ Warp.setBeforeMainLoop
-        (putStrLn ("Trading Game: http://127.0.0.1:" ++ show port ++ " (" ++ show duration ++ ", 8 human players + 2 bots)")) Warp.defaultSettings
-  runIO $ runConcurrent $ withWorkers
-    (liftIO (void (runExchange (webRuntime game))) : botActions)
-    (liftIO (Warp.runSettings settings (webApplication game)))
-  
+  clock <- newLiveClock
+  withGameManager clock $ \manager -> do
+    lobby <- newWebLobby manager duration
+    let settings = Warp.setHost "127.0.0.1" $ Warp.setPort port $ Warp.setBeforeMainLoop
+          (putStrLn ("Trading Game: http://127.0.0.1:" ++ show port)) Warp.defaultSettings
+    Warp.runSettings settings (lobbyApplication lobby)

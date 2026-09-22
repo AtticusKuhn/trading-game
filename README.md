@@ -34,53 +34,94 @@ result contains `settledPlayer :: Player` (ID, name, and private number) and
 `playerPayoff :: Rational`, including players who never traded. These details
 are revealed only after resolution.
 
-## Web debugging prototype
+## Web prototype: concurrent games
 
 ```sh
 nix run path:.#web
-# Custom port and game duration in seconds (default: 3000, 3600):
+# Custom port and suggested duration for the creation form:
 nix run path:.#web -- 3000 60
 ```
 
-Open `http://127.0.0.1:3000`, select a player, and place buy or sell limit orders.
-The page shows your private number, open buys and sells, the latest twenty
-trades, and a settlement table with every player's private number and payoff.
-Prices accept integers, exact decimals, and fractions. An accepted order can
-remain open until another order matches.
+Open `http://127.0.0.1:3000` to see all games, including upcoming and completed
+games, and create a game. Choose start/end times **in UTC**, player names, and
+human, random trading bot, or market-making bot for each roster entry. Blank
+rows are ignored; add more rows with the button. Names must be nonblank and
+unique within a game, and the end must be after the start. All-bot games are
+allowed. Games and browser sessions are stored in memory and reset on restart.
 
-The roster is fixed at startup by `webPlayerNames` in `TradingGame.Web`:
-`alice`, `bob`, `carol`, `dan`, `eve`, `fred`, `gwen`, `hal`, `market-maker`, and
-`noise-trader`. The last two players also run bot programs. Each player receives
-a private number between 1 and 9 at startup; every player contributes to the sum,
-even before anyone joins. Joining selects an existing player by exact,
-case-sensitive name. Unknown names return an HTTP 400 error and never create
-players. Rejoining from the same or another browser uses the same private number,
-orders, positions, and settlement.
+The server draws each player's private number uniformly from 1 through 9 at
+creation. The complete roster, private numbers, and accounts are then fixed.
+Upcoming games cannot be joined or traded in. Their page automatically opens
+the join form when their start time arrives. A game with a past start begins
+immediately, keeping its original end time; if the end has already passed, it
+settles immediately without replaying missed trading time.
 
-Use separate browser profiles/private windows for different players. An opaque
-HttpOnly cookie remembers the selected player across refreshes. Names select
+Each game has its own `/games/ID/` page, exchange, bots, and browser sessions.
+Choose a human roster member to trade. Bot identities cannot be selected by
+browsers. Rejoining preserves that player's private number, orders, and account.
+The same browser can play different games independently. Use separate browser
+profiles/private windows for different players within one game. Names select
 identities in this trusted local demo; they are not authentication credentials.
-The clock starts at server startup, and restarting resets all state. The server
-binds to loopback for local debugging.
+The server binds to loopback.
 
-One bot replenishes a small two-sided book every two seconds, estimating the sum
-from its own private number; the other alternates buying and selling at the best
-available quotes every three seconds. Both use the existing trading effects and
-stop at settlement. The server remains available to inspect the final game.
+The game page shows your private number, open orders, recent trades, and final
+results. Prices accept integers, exact decimals, and fractions. HTMX submits
+orders; SSE sends rendered Blaze HTML for exchange changes, directory updates,
+and scheduled starts. Streams send a full snapshot on reconnect and keep-alive
+comments every fifteen seconds. There is no client polling or custom JavaScript.
+HTMX, its SSE extension, and Tailwind load from pinned CDN URLs.
 
-`TradingGame.Web` renders Blaze HTML and uses WAI/Warp. The order form posts with
-HTMX; the server pushes rendered HTML directly through the
-[HTMX SSE extension](https://htmx.org/extensions/sse/). Exchange changes wake the
-streams through STM, with keep-alive comments every fifteen seconds and a full
-snapshot on reconnect. Updates leave the order form intact. There is no client
-polling or custom JavaScript. HTMX, its SSE extension, and the development-only
-[Tailwind browser build](https://tailwindcss.com/docs/installation/play-cdn) load
-from pinned CDN URLs, so the browser needs internet access.
+The market maker estimates the sum using its secret and the configured roster
+size, then replenishes both sides of the book. The random trading bot draws
+sides, prices, and quantities from a server-generated seed. Both use the shared
+trading effects; seeded bots also work in deterministic simulations. Workers
+start when the game opens and are cancelled at its original end time.
 
-The terminal entrypoint below remains available. `nix flake check path:.` also
-builds the web executable and runs QuickCheck properties covering HTTP order
-gating, identity binding, concurrent joins, account continuity, unknown-name rejection,
-and SSE framing.
+## Game management
+
+`TradingGame.ManageGames` provides a transport-independent directory effect:
+
+```haskell
+data ManageGames :: Effect where
+  CreateNewGame :: NewGameConfig -> ManageGames m (Either CreateGameError GameId)
+  LookupGame :: GameId -> ManageGames m (Maybe GameSummary)
+  ListAllGames :: ManageGames m [GameSummary]
+
+data NewGameConfig = NewGameConfig
+  { gameStart :: UTCTime
+  , gameEnd :: UTCTime
+  , gameRoster :: [RosterEntry]
+  }
+
+data RosterEntry = RosterEntry
+  { rosterName :: String
+  , rosterType :: PlayerType
+  }
+
+data PlayerType = HumanPlayer | RandomTradingBot | MarketMakingBot
+```
+
+`withGameManager clock` scopes the in-memory directory and all game workers;
+`runManageGames manager` interprets the effect. Summaries expose only IDs,
+configuration, and directory status (`Upcoming`, `Running`, `Completed`, or
+`Failed`), never private numbers. Creation is atomic, including concurrent
+requests. A failing game's workers are stopped and its directory entry becomes
+unavailable; other games continue. Leaving the manager scope cancels and joins
+its workers.
+
+Scheduling is outside the exchange model: no `LiveRuntime` exists before a
+game's start. The host-only `gameRuntime` returns nothing for upcoming games and
+ensures a due runtime is created exactly once. `Trading`, `Resolved`, and order
+errors are unchanged. The configured start/end timestamps are retained even
+when creation occurs after the start. Existing standalone simulation/live
+entrypoints and the terminal debugging adapter continue to use the same trading
+rules. The terminal keeps its small fixed demo; the web adapter uses the manager
+to select a runtime.
+
+Property tests cover concurrent creation, time-window boundaries, automatic
+start/settlement, fixed rosters, invalid configuration, independent exchanges,
+HTTP cookie isolation, future-game request gating, form round trips, and SSE
+start notifications. Scheduling tests inject a manual clock rather than sleeping.
 
 ## Terminal prototype
 

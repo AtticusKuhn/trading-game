@@ -51,7 +51,6 @@ data TradingGame :: Effect where
   
   
 -- The list of players should be a per-game static constant which is established at the beginning of the game and does not change over the course of the game. You cannot "dynamically add" a new player during a running game.
-  game.
 data PlayerSession :: Effect where
     JoinGameAsPlayer :: String -> PlayerSession m LoginResult
     Logout :: PlayerSession m LogoutResult
@@ -92,3 +91,9 @@ When communicating with the user, do not write text that is
 verbose in implementation details ("wall-of-text" writing style): this was changed to that, these things were split,
 those things were merged, this was left untouched, tests were added for this, and so on.
 When communicating with the user, instead prioritize saying what is actually important: Why are we doing this? What is the value? How risky or urgent is this work? Where do you want my input? What should I pay attention to? 
+
+# Storing Data
+Right now, we're just storing everything in 
+in-memory data structures for simplicity. 
+We may add a database (e.g. SQLite) in the future,
+but not yet.
