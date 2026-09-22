@@ -9,7 +9,7 @@ import Test.QuickCheck
 import TradingGame
 
 -- Each player submits a variable-length list of orders, then waits for settlement.
-genTradingGame :: Gen (Eff '[TradingGame] ())
+genTradingGame :: Gen (Eff '[TradingGame, Concurrent] ())
 genTradingGame = do
   orders <- listOf genOrder
   pure $ mapM_ submitOrder orders >> void awaitSettlement

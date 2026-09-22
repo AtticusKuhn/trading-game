@@ -9,7 +9,7 @@ import Control.Effect (Eff, IOE, (:<), interpret, liftIO)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (evaluate)
-import Control.Monad (void, when)
+import Control.Monad (when)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import TradingGame.Concurrent
@@ -63,12 +63,14 @@ data LiveRuntime = LiveRuntime
   { runtimeClock :: LiveClock
   , runtimeTrace :: LiveEvent -> IO ()
   , runtimeEngine :: MVar Engine
+  , runtimeSnapshot :: TVar ExchangeState
   , runtimeFinal :: TMVar Engine
   }
 
 newLiveRuntime :: LiveClock -> (LiveEvent -> IO ()) -> Engine -> IO LiveRuntime
 newLiveRuntime clock trace initial =
-  LiveRuntime clock trace <$> newMVar initial <*> newEmptyTMVarIO
+  LiveRuntime clock trace <$> newMVar initial
+    <*> newTVarIO (exchangeSnapshot (opensAt (engineInfo initial)) initial) <*> newEmptyTMVarIO
 
 -- Sample time only after acquiring the lock. Masking keeps final publication
 -- and the engine commit together; exceptions restore the previous engine.
@@ -82,6 +84,7 @@ modifyLiveEngine runtime action = modifyMVarMasked (runtimeEngine runtime) $ \en
       runtimeTrace runtime (ExchangeClosed now)
       atomically (putTMVar (runtimeFinal runtime) updated)
     _ -> pure ()
+  atomically $ writeTVar (runtimeSnapshot runtime) (exchangeSnapshot now updated)
   pure (updated, result)
 
 -- Workers apply the shared rules directly. Waiting happens outside the lock;
@@ -120,39 +123,27 @@ runWithCurrentPlayer runtime action = do
       roster <- liftIO (players <$> readMVar (runtimeEngine runtime))
       if pid `notElem` map playerID roster
         then pure (Left (UnknownPlayerId pid))
-        else Right <$> interpret (\request -> do
-          decision <- liftIO (requestLive runtime pid request)
-          case decision of
-            Reply value -> pure value
-            ResumeAt target -> liftIO $
-              clockAlarm (runtimeClock runtime) target >>= atomically
-            WhenResolved -> do
-              final <- liftIO (runExchange runtime)
-              pure (settlementFor pid final)) action
+        else Right <$> interpret (liftIO . handleLiveRequest runtime pid) action
 
-runLivePlayer :: IOE :< effs => UTCTime -> LiveRuntime -> PlayerProgram effs -> Eff effs ()
-runLivePlayer close runtime (player, program) = loop program
-  where
-    pid = playerID player
-    finished = readTMVar (runtimeFinal runtime)
-    loop current = do
-      step <- stepPlayer current
-      case step of
-        Finished -> pure ()
-        Requested request resume -> do
-          answer <- liftIO (requestLive runtime pid request)
-          case answer of
-            Reply value -> loop (resume value)
-            ResumeAt target
-              | target >= close -> void (liftIO (atomically finished))
-              | otherwise -> do
-                  alarm <- liftIO (clockAlarm (runtimeClock runtime) target)
-                  awake <- liftIO $ atomically $
-                    (finished >> pure False) `orElse` (alarm >> pure True)
-                  when awake (loop (resume ()))
-            WhenResolved -> do
-              final <- liftIO (atomically finished)
-              loop (resume (settlementFor pid final))
+-- Waiting happens outside the engine lock. The snapshot comparison and STM
+-- subscription are atomic, so changes between requests cannot be lost.
+handleLiveRequest :: LiveRuntime -> PlayerId -> TradingGame m a -> IO a
+handleLiveRequest runtime pid request = do
+  decision <- requestLive runtime pid request
+  case decision of
+    Reply value -> pure value
+    ResumeAt target -> clockAlarm (runtimeClock runtime) target >>= atomically
+    WhenResolved -> settlementFor pid <$> runExchange runtime
+    WhenExchangeChanges previous -> do
+      atomically (readTVar (runtimeSnapshot runtime) >>= check . exchangeChanged previous)
+      handleLiveRequest runtime pid GetExchangeState
+
+-- Each request is interpreted directly, so child threads never capture across
+-- the IO boundary in runConcurrent. The enclosing live runner owns cancellation
+-- at closure; standalone callers can continue inspecting the resolved game.
+runLivePlayer :: IOE :< effs => LiveRuntime -> PlayerProgram effs -> Eff effs ()
+runLivePlayer runtime (player, program) = runConcurrent $
+  interpret (liftIO . handleLiveRequest runtime (playerID player)) program
 
 runLive :: (IOE :< effs, Concurrent :< effs) => [PlayerProgram effs] -> Eff effs [Settlement]
 runLive = runLiveFor 3600
@@ -176,5 +167,5 @@ runLiveEngineWith clock config programs = do
   let initial = newEngine start (liveDuration config)
         (map fst programs)
   runtime <- liftIO (newLiveRuntime clock (onLiveEvent config) initial)
-  let worker = runLivePlayer (closesAt (engineInfo initial)) runtime
+  let worker = runLivePlayer runtime
   withWorkers (map worker programs) (liftIO (runExchange runtime))

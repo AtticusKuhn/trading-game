@@ -8,9 +8,11 @@
 -- names select existing players and opaque cookies identify browser sessions.
 module TradingGame.Web where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Concurrent.STM
-import Control.Effect (Eff, IOE, (:<), liftIO, runIO)
-import Control.Monad (forM_, void, when)
+import Control.Effect (Eff, IOE, (:<), interpret, liftIO, runIO)
+import Control.Monad (forM_, forever, void, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B
 import Data.ByteString.Builder (Builder, byteString)
@@ -42,7 +44,6 @@ newtype BrowserSession = BrowserSession
 
 data WebGame = WebGame
   { webRuntime :: LiveRuntime
-  , webRevision :: TVar Integer
   , webSessions :: TVar (Map.Map BS.ByteString BrowserSession)
   , webPlayers :: [Player]
   , webBots :: [Player]
@@ -59,23 +60,41 @@ newWebGame duration = do
   start <- clockNow clock
   roster <- sequence
     [Player (PlayerId n) name <$> randomRIO (1, 9) | (n, name) <- zip [1..] webPlayerNames]
-  revision <- newTVarIO 0
-  let changed = atomically (modifyTVar' revision (+1))
-      trace (RequestHandled _ _ (SubmitOrder _) _) = changed
-      trace (ExchangeClosed _) = changed
-      trace _ = pure ()
-  runtime <- newLiveRuntime clock trace (newEngine start duration roster)
+  runtime <- newLiveRuntime clock (const (pure ())) (newEngine start duration roster)
   sessions <- newTVarIO Map.empty
-  pure (WebGame runtime revision sessions roster (drop 8 roster))
+  pure (WebGame runtime sessions roster (drop 8 roster))
 
 -- Each HTTP request reinstalls the existing session and trading interpreters.
 -- Identity always comes from the server's cookie table, never form fields.
-asPlayer :: WebGame -> BrowserSession -> Eff '[TradingGame, PlayerSession, IOE] a -> IO a
+asPlayer :: WebGame -> BrowserSession -> Eff '[TradingGame, Concurrent, PlayerSession, IOE] a -> IO a
 asPlayer game session action = do
   result <- runIO $ runPlayerSession (webPlayers game) $ do
     void (joinGameAsPlayer (displayName (sessionPlayer session)))
-    runWithCurrentPlayer (webRuntime game) action
+    runConcurrent (runWithCurrentPlayer (webRuntime game) action)
   either (ioError . userError . show) pure result
+
+-- Every HTTP command batch and SSE connection runs the same player as the
+-- terminal. This adapter only translates HTTP input and typed player output.
+runWebInteraction
+  :: WebGame -> BrowserSession -> IO PlayerCommand -> (PlayerInfo -> IO ())
+  -> IO InteractionExit
+runWebInteraction game session input output = asPlayer game session $
+  interpret (\request -> case request of
+    ReadInput -> liftIO input
+    SendInfo info -> liftIO (output info)) interactivePlayer
+
+runWebCommands :: WebGame -> BrowserSession -> [PlayerCommand] -> IO [PlayerInfo]
+runWebCommands game session commands = do
+  input <- newTVarIO (commands ++ [Quit])
+  output <- newTVarIO []
+  let readCommand = atomically $ do
+        remaining <- readTVar input
+        case remaining of
+          [] -> pure Quit
+          command:rest -> writeTVar input rest >> pure command
+      writeInfo info = atomically (modifyTVar' output (info:))
+  void (runWebInteraction game session readCommand writeInfo)
+  reverse <$> readTVarIO output
 
 lookupSession :: WebGame -> Request -> IO (Maybe BrowserSession)
 lookupSession game request = do
@@ -133,8 +152,8 @@ webApplication game request respond = do
     ("GET", []) -> case session of
       Nothing -> page (joinView (webPlayers game) Nothing)
       Just current -> do
-        (snapshot, settlement) <- playerSnapshot game current
-        page (gameView current snapshot settlement)
+        (secret, snapshot, settlement) <- playerSnapshot game current
+        page (gameView current secret snapshot settlement)
     ("POST", ["join"]) -> do
       form <- readForm request
       result <- case form of
@@ -152,7 +171,10 @@ webApplication game request respond = do
         case form >>= parseOrderForm of
           Left problem -> feedback problem
           Right order -> do
-            result <- asPlayer game current (submitOrder order)
+            replies <- runWebCommands game current [PlaceOrder order]
+            result <- case [value | OrderSubmitted value <- replies] of
+              [value] -> pure value
+              _ -> ioError (userError "interactive player did not answer the order")
             feedback $ case result of
               Right (OrderId oid) -> "Order #" ++ show oid ++ " accepted. Unfilled quantity remains open."
               Left GameClosed -> "The game has settled; orders are closed."
@@ -162,35 +184,50 @@ webApplication game request respond = do
       Just current -> respond (eventStream game current)
     _ -> respond (htmlResponse status404 [] (H.p "Page not found."))
 
-playerSnapshot :: WebGame -> BrowserSession -> IO (ExchangeState, Maybe Settlement)
-playerSnapshot game session = asPlayer game session $ do
-  snapshot <- getExchangeState
+playerSnapshot :: WebGame -> BrowserSession -> IO (Integer, ExchangeState, Maybe Settlement)
+playerSnapshot game session = do
+  replies <- runWebCommands game session [ShowPrivateNumber, ShowExchange]
+  secret <- case [value | PrivateNumber value <- replies] of
+    [value] -> pure value
+    _ -> ioError (userError "interactive player did not provide a private number")
+  snapshot <- case reverse (sortOn observedAt [value | ExchangeSnapshot value <- replies]) of
+    value:_ -> pure value
+    [] -> ioError (userError "interactive player did not provide a snapshot")
   result <- case gamePhase snapshot of
     Trading -> pure Nothing
-    Resolved _ -> Just <$> awaitSettlement
-  pure (snapshot, result)
+    Resolved _ -> do
+      settled <- runWebCommands game session [ShowSettlement]
+      case [value | PlayerSettlement value <- settled] of
+        value:_ -> pure (Just value)
+        [] -> ioError (userError "interactive player did not provide settlement")
+  pure (secret, snapshot, result)
 
--- A revision counter coalesces updates for slow clients without an unbounded
--- event queue. Read the revision BEFORE the snapshot: a concurrent change can
--- cause a harmless duplicate, but cannot be missed. Reconnects get a full view.
+-- Reconnects start a fresh player scope and receive a full snapshot. The player
+-- owns updates and settlement; the transport only frames HTML and heartbeats.
+-- Disconnect/failed writes cancel and join both scoped workers.
 eventStream :: WebGame -> BrowserSession -> Response
 eventStream game session = responseStream status200
   [(hContentType, "text/event-stream"), (hCacheControl, "no-cache, no-store"), ("X-Accel-Buffering", "no")] $ \send flush -> do
-    let publish = do
-          revision <- readTVarIO (webRevision game)
-          (snapshot, settlement) <- playerSnapshot game session
-          send (sseHtml "exchange" (exchangeView snapshot settlement))
-          flush
-          case gamePhase snapshot of
-            Resolved _ -> send "event: closed\ndata: done\n\n" >> flush
-            Trading -> listen revision
-        listen previous = do
-          heartbeat <- registerDelay 15000000
-          changed <- atomically $
-            (readTVar (webRevision game) >>= \current -> check (current /= previous) >> pure True)
-            `orElse` (readTVar heartbeat >>= check >> pure False)
-          if changed then publish else send ": keep-alive\n\n" >> flush >> listen previous
-    publish
+    finished <- newEmptyTMVarIO
+    latest <- newTVarIO Nothing
+    outputLock <- newMVar ()
+    let write chunk = withMVar outputLock (\() -> send chunk >> flush)
+        publish info = case info of
+          ExchangeSnapshot snapshot -> do
+            atomically (writeTVar latest (Just snapshot))
+            case gamePhase snapshot of
+              Trading -> write (sseHtml "exchange" (exchangeView snapshot Nothing))
+              Resolved _ -> pure ()
+          PlayerSettlement result -> do
+            snapshot <- atomically (readTVar latest)
+            forM_ snapshot $ \current -> write (sseHtml "exchange" (exchangeView current (Just result)))
+            write "event: closed\ndata: done\n\n"
+            atomically (putTMVar finished ())
+          _ -> pure ()
+        input = atomically (readTMVar finished) >> pure Quit
+        heartbeat = forever (threadDelay 15000000 >> write ": keep-alive\n\n")
+    runIO $ runConcurrent $ withWorkers [liftIO heartbeat] $
+      liftIO (void (runWebInteraction game session input publish))
 
 -- Prefix every line, including user-controlled newlines, per the SSE format.
 sseHtml :: BS.ByteString -> Html -> Builder
@@ -238,13 +275,13 @@ joinView roster problem = panel $ do
       forM_ roster $ \player -> H.option ! A.value (H.toValue (displayName player)) $ toHtml (displayName player)
     H.button ! A.type_ "submit" ! A.class_ "rounded bg-indigo-700 px-4 py-2 font-semibold text-white" $ "Join game"
 
-gameView :: BrowserSession -> ExchangeState -> Maybe Settlement -> Html
-gameView session snapshot settlement = do
+gameView :: BrowserSession -> Integer -> ExchangeState -> Maybe Settlement -> Html
+gameView session secret snapshot settlement = do
   panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ toHtml ("Playing as " ++ displayName (sessionPlayer session))
     H.p $ do
       "Your private number: "
-      H.strong ! A.class_ "font-mono text-2xl text-indigo-700" $ toHtml (show (privateNumber (sessionPlayer session)))
+      H.strong ! A.class_ "font-mono text-2xl text-indigo-700" $ toHtml (show secret)
   panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ "New limit order"
     H.form ! A.method "post" ! A.action "/orders" ! attr "hx-post" "/orders" ! attr "hx-target" "#order-result"

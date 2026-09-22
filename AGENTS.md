@@ -17,6 +17,19 @@
 # Ways of Running
 Should be flexible enough to run either as terminal CLI program or as web UI.
 
+
+## Terminal UI
+The terminal UI and web UI should share 99% of business logic and share the same behavior, but differ in how each 
+view is rendered.
+The terminal UI is just for quick debugging. The terminal UI does not have to be pretty, and it can be a 
+quick-and-dirty ASCII interface for debugging.
+
+## Web UI
+The Web UI is more intended for end-users.
+Use SSE instead of polling on the client side. 
+The server should communicate by sending HTML, not JSON to the client.
+Try not to use too much client-side JS, but rely on HTMX as much as possible.
+
 # Effects
 ```haskell
 data Concurrent :: Effect where
@@ -56,6 +69,12 @@ runTradingGame :: [Player effs] -> Eff effs [Settlement]
 runLive :: (IOE :< effs, Concurrent :< effs) => [Player effs] -> Eff effs [Settlement]
 ```
 
+The simulator is deterministic, and runs in virtual time in a single thread. The simulator is used for testing
+correctness. If an effect blocks in the simulator, then the entire simulator blocks, but this is intended behavior
+and not a bug, because in testing we have custom effect handlers that do not block.
+
+
+
 # Testing Strategy
 do NOT write glorified unit tests.
 Write genuinely property-based tests.
@@ -66,3 +85,10 @@ If a test has a hardcoded constant in it, that's code-smell that this
 test is potentially just a unit test in disguise, and not a true
 property-based quickcheck property.
 
+
+# Communication Strategy
+
+When communicating with the user, do not write text that is
+verbose in implementation details ("wall-of-text" writing style): this was changed to that, these things were split,
+those things were merged, this was left untouched, tests were added for this, and so on.
+When communicating with the user, instead prioritize saying what is actually important: Why are we doing this? What is the value? How risky or urgent is this work? Where do you want my input? What should I pay attention to? 

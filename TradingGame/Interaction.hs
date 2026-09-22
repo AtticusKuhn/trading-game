@@ -4,12 +4,13 @@
 {-# LANGUAGE TypeOperators #-}
 
 module TradingGame.Interaction
-  ( PlayerInteraction(..), PlayerCommand(..), PlayerInfo(..)
+  ( PlayerInteraction(..), PlayerCommand(..), PlayerInfo(..), InteractionExit(..)
   , readInput, sendInfo, execute, interactivePlayer
   ) where
 
 import Control.Effect (Eff, Effect, (:<), send)
 import Data.Time.Clock (NominalDiffTime)
+import TradingGame.Concurrent
 import TradingGame.Core
 
 -- Commands and replies are transport-independent. Only the handler decides
@@ -54,13 +55,23 @@ execute command = case command of
   ShowSettlement -> awaitSettlement >>= sendInfo . PlayerSettlement
   Help -> sendInfo HelpInfo
 
--- In particular, this specializes to Eff '[TradingGame, PlayerInteraction] ().
-interactivePlayer :: (TradingGame :< effs, PlayerInteraction :< effs) => Eff effs ()
-interactivePlayer = loop
+data InteractionExit = QuitApplication | LeftGame deriving (Eq, Show)
+
+-- Both adapters run this exact program. The update worker is scoped to the
+-- command loop, and stops naturally after publishing the final settlement.
+interactivePlayer
+  :: (TradingGame :< effs, PlayerInteraction :< effs, Concurrent :< effs)
+  => Eff effs InteractionExit
+interactivePlayer = withWorkers [getExchangeState >>= updates] loop
   where
+    updates snapshot = do
+      sendInfo (ExchangeSnapshot snapshot)
+      case gamePhase snapshot of
+        Resolved _ -> awaitSettlement >>= sendInfo . PlayerSettlement
+        Trading -> awaitExchangeChange snapshot >>= updates
     loop = do
       command <- readInput
       case command of
-        Quit -> pure ()
-        LeaveGame -> pure ()
+        Quit -> pure QuitApplication
+        LeaveGame -> pure LeftGame
         cmd -> execute cmd >> loop

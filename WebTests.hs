@@ -4,13 +4,17 @@
 module WebTests (webProperties) where
 
 import Control.Concurrent.Async (mapConcurrently)
+import qualified Control.Concurrent.Async as Async
 import Control.Concurrent.MVar (readMVar)
-import Control.Concurrent.STM (readTVarIO)
+import Control.Concurrent.STM
 import qualified Data.ByteString.Char8 as B
 import Data.ByteString.Builder (toLazyByteString)
 import qualified Data.ByteString.Lazy as LBS
 import Data.Either (isRight)
 import Data.List (find, nub, sort)
+import Control.Monad (void)
+import Data.Maybe (isJust)
+import LiveTests (liveProperty, manualClock)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -97,11 +101,13 @@ prop_settlementTable :: Property
 prop_settlementTable = forAll genEngine $ \engine ->
   forAll (elements (players engine)) $ \player ->
     let pid = playerID player
-        viewAt now = case handleRequest now pid GetExchangeState engine of
-          (current, Reply snapshot) -> renderHtml (exchangeView snapshot result)
-            where result = case snd (handleRequest now pid AwaitSettlement current) of
-                    Reply value -> Just value
-                    WhenResolved -> Nothing
+        viewAt now = renderHtml (exchangeView (exchangeSnapshot now current) result)
+          where
+            current = advanceTo now engine
+            result = case gamePhase currentSnapshot of
+              Trading -> Nothing
+              Resolved _ -> Just (settlementFor pid current)
+            currentSnapshot = exchangeSnapshot now current
         -- Read the first table's rows as escaped text, independent of styling.
         rows html = map (filter (not . T.null) . map (T.drop 1 . snd . T.breakOn ">") . T.splitOn "<")
           (drop 1 (T.splitOn "<tr>" body))
@@ -160,5 +166,30 @@ prop_unknownPlayer = forAllShrink (arbitrary `suchThat` (`notElem` webPlayerName
       , after === before
       ]
 
+-- An idle HTTP stream receives closure from the shared player's worker, sends
+-- its final view, and terminates without another browser command.
+prop_streamClosure :: Property
+prop_streamClosure = forAll genEngine $ \initial -> forAll (elements (players initial)) $ \player ->
+  liveProperty "SSE automatic settlement" $ do
+    (clock, advance) <- manualClock (opensAt (engineInfo initial))
+    runtime <- newLiveRuntime clock (const (pure ())) initial
+    sessions <- newTVarIO Map.empty
+    chunks <- newTVarIO []
+    let game = WebGame runtime sessions (players initial) []
+        (_, _, stream) = responseToStream (eventStream game (BrowserSession player))
+        write chunk = atomically (modifyTVar' chunks (++ [toLazyByteString chunk]))
+    Async.withAsync (stream (\body -> body write (pure ()))) $ \connection -> do
+      atomically (readTVar chunks >>= check . not . null)
+      advance (closesAt (engineInfo initial))
+      void (runExchange runtime)
+      Async.wait connection
+      wire <- LBS.concat <$> readTVarIO chunks
+      final <- atomically (tryReadTMVar (runtimeFinal runtime))
+      pure $ conjoin
+        [ property ("event: closed\ndata: done\n\n" `LBS.isSuffixOf` wire)
+        , property ("Player results" `B.isInfixOf` LBS.toStrict wire)
+        , property (isJust final)
+        ]
+
 webProperties :: [Property]
-webProperties = [prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer]
+webProperties = [prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer, prop_streamClosure]

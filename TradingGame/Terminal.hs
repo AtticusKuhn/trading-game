@@ -4,7 +4,7 @@
 {-# LANGUAGE TypeOperators #-}
 
 module TradingGame.Terminal
-  ( runTerminal, terminalSession, parseCommand, renderInfo, commandHelp ) where
+  ( runTerminal, terminalSession, terminalSessionWith, parseCommand, renderInfo, commandHelp ) where
 
 import Control.Effect (Eff, IOE, (:<), interpret, liftIO)
 import Control.Monad (void)
@@ -12,6 +12,7 @@ import Data.Char (isDigit, isSpace)
 import Data.Ratio ((%), numerator, denominator)
 import System.IO (hFlush, isEOF, stdout)
 import Text.Read (readMaybe)
+import TradingGame.Concurrent
 import TradingGame.Core
 import TradingGame.Interaction
 import TradingGame.Live (LiveRuntime, runWithCurrentPlayer)
@@ -22,7 +23,13 @@ import TradingGame.Session
 terminalSession
   :: (PlayerSession :< effs, PlayerInteraction :< effs, IOE :< effs)
   => LiveRuntime -> Eff effs ()
-terminalSession runtime = joinLoop
+terminalSession runtime = terminalSessionWith (runConcurrent . runWithCurrentPlayer runtime)
+
+terminalSessionWith
+  :: (PlayerSession :< effs, PlayerInteraction :< effs, IOE :< effs)
+  => (Eff (TradingGame ': Concurrent ': effs) InteractionExit -> Eff effs (Either SessionError InteractionExit))
+  -> Eff effs ()
+terminalSessionWith runPlayer = joinLoop
   where
     joinLoop = do
       line <- liftIO $ do
@@ -41,19 +48,13 @@ terminalSession runtime = joinLoop
             Left problem -> liftIO (print problem) >> joinLoop
             Right _ -> do
               liftIO (putStrLn ("Joined as " ++ name ++ "."))
-              outcome <- runWithCurrentPlayer runtime gameLoop
+              outcome <- runPlayer interactivePlayer
               void logout
               case outcome of
                 Left problem -> liftIO (print problem) >> joinLoop
-                Right LeaveGame -> joinLoop
+                Right LeftGame -> joinLoop
                 Right _ -> pure ()
         _ -> liftIO (putStrLn "Join first with: join NAME (or quit).") >> joinLoop
-    gameLoop = do
-      command <- readInput
-      case command of
-        Quit -> pure Quit
-        LeaveGame -> pure LeaveGame
-        other -> execute other >> gameLoop
 
 runTerminal :: IOE :< effs => Eff (PlayerInteraction ': effs) a -> Eff effs a
 runTerminal = interpret $ \request -> case request of

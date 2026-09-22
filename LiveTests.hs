@@ -14,7 +14,7 @@ import Data.Ratio ((%))
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 import GHC.Conc (ThreadStatus(..), BlockReason(..), threadStatus)
 import Test.QuickCheck hiding (replay, total)
-import TestSupport (testPlayer)
+import TestSupport (testPlayer, genEngine, genOrder)
 import TradingGame
 
 -- Positive gaps preserve distinct IDs and ordered wakeups even while shrinking.
@@ -94,6 +94,7 @@ sameDecision :: TradingGame m a -> Decision a -> Decision a -> Bool
 sameDecision request expected actual = case request of
   GetMyPrivateNumber -> expected == actual
   GetExchangeState -> expected == actual
+  AwaitExchangeChange _ -> expected == actual
   SubmitOrder _ -> expected == actual
   Wait _ -> expected == actual
   WaitUntil _ -> expected == actual
@@ -119,6 +120,7 @@ liveProperties =
   , property prop_lockRecovery
   , property prop_exchangeFailureSupervision
   , prop_realClock
+  , property prop_exchangeUpdates
   ]
 
 -- Compare direct live responses and final state with the pure engine.
@@ -282,7 +284,7 @@ prop_settlementBroadcast scenario generated = liveProperty "shared settlement no
         result <- awaitSettlement
         unless (result == Settlement total expected results) (error "wrong shared settlement"))
       programs = [player buyer Buy buyerSecret payoff, player seller Sell sellerSecret (-payoff)]
-  Async.withAsync (Async.mapConcurrently_ (runIO . runLivePlayer close runtime) programs) $ \workers -> do
+  Async.withAsync (Async.mapConcurrently_ (runIO . runLivePlayer runtime) programs) $ \workers -> do
     awaitTrace events (\trace -> all (`hasSettlementWait` trace) [buyer, seller])
     advance close
     final <- runExchange runtime
@@ -362,3 +364,26 @@ prop_realClock = forAllShrink arbitrary shrink $ \(identifier, secret) ->
       result <- runIO $ runConcurrent $ runLiveFor (fromRational (micros % 1000000))
         [(testPlayer (PlayerId identifier) secret, void awaitSettlement)]
       pure (result === [Settlement (toInteger secret) 0 [PlayerResult (testPlayer (PlayerId identifier) secret) 0]])
+
+-- All subscribers wake on orders or closure, even if the change lands between
+-- the request decision and entering STM. Every listener gets one consistent view.
+prop_exchangeUpdates :: Bool -> Property
+prop_exchangeUpdates closing = forAll genEngine $ \initial -> forAll genOrder $ \order ->
+  liveProperty "exchange update broadcast" $ do
+    (clock, advance) <- manualClock (opensAt (engineInfo initial))
+    subscribed <- newTVarIO (0 :: Int)
+    let trace (RequestHandled _ _ (AwaitExchangeChange _) (WhenExchangeChanges _)) =
+          atomically (modifyTVar' subscribed (+1))
+        trace _ = pure ()
+        roster = players initial
+        previous = exchangeSnapshot (opensAt (engineInfo initial)) initial
+    runtime <- newLiveRuntime clock trace initial
+    Async.withAsync (Async.mapConcurrently
+      (\player -> handleLiveRequest runtime (playerID player) (AwaitExchangeChange previous)) roster) $ \listeners -> do
+      atomically (readTVar subscribed >>= check . (== length roster))
+      if closing then advance (closesAt (engineInfo initial)) >> void (runExchange runtime)
+        else void (handleLiveRequest runtime (playerID (head roster)) (SubmitOrder order))
+      snapshots <- Async.wait listeners
+      now <- clockNow clock
+      current <- readMVar (runtimeEngine runtime)
+      pure (snapshots === replicate (length roster) (exchangeSnapshot now current))

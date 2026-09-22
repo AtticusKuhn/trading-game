@@ -15,6 +15,7 @@ import LiveTests (liveProperties)
 import InteractionTests (interactionProperties)
 import SessionTests (sessionProperties)
 import ConcurrentTests (concurrentProperties)
+import SimulationTests (simulationProperties)
 import WebTests (webProperties)
 
 -- Eff programs have no Show instance. Print the secrets and resulting
@@ -67,6 +68,6 @@ main = do
     ([ prop_settlementsSumToZero
     , prop_singlePlayerSettlementIsZero
     , prop_samePriceLeavesOnlyOneSide
-    ] ++ engineProperties ++ liveProperties ++ interactionProperties ++ concurrentProperties ++ sessionProperties ++ webProperties)
+    ] ++ engineProperties ++ liveProperties ++ interactionProperties ++ concurrentProperties ++ simulationProperties ++ sessionProperties ++ webProperties)
   discoverLaws
   unless (all isSuccess results) exitFailure

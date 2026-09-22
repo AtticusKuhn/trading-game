@@ -6,27 +6,20 @@
 
 module InteractionTests (interactionProperties) where
 
-import qualified Control.Concurrent.Async as Async
-import Control.Concurrent.MVar
+import Control.Concurrent.STM
 import Control.Effect (Eff, interpret, lift, liftIO, run, runIO)
 import qualified Control.Effect.State.Strict as State
-import Data.List (foldl')
+import Control.Monad (void)
 import Data.Ratio ((%))
-import Data.Time.Clock (addUTCTime)
 import Test.QuickCheck
 import LiveTests (manualClock, liveProperty)
-import TestSupport (genOrder, testPlayer)
+import TestSupport (genOrder, genRoster)
 import TradingGame
 import TradingGame.Terminal (parseCommand)
 
 type ScriptState = ([PlayerCommand], [PlayerInfo])
 
--- An entirely pure handler, outside the simulator/worker. The remaining input
--- lets properties detect accidental reads after Quit as well as lost replies.
-runScript
-  :: [PlayerCommand]
-  -> Eff (PlayerInteraction ': effs) a
-  -> Eff effs (ScriptState, a)
+runScript :: [PlayerCommand] -> Eff (PlayerInteraction ': effs) a -> Eff effs (ScriptState, a)
 runScript commands action = State.runState (commands, []) $
   interpret (\request -> case request of
     ReadInput -> do
@@ -37,68 +30,73 @@ runScript commands action = State.runState (commands, []) $
     SendInfo info -> State.modify @ScriptState (\(remaining, output) -> (remaining, output ++ [info])))
     (lift action)
 
+-- Unsolicited public updates can interleave with command replies in live time.
+commandReplies :: [PlayerInfo] -> [PlayerInfo]
+commandReplies = filter (\info -> case info of
+  ExchangeSnapshot _ -> False
+  PlayerSettlement _ -> False
+  _ -> True)
+
+genCommands :: Gen [PlayerCommand]
+genCommands = listOf (oneof [PlaceOrder <$> genOrder, elements [ShowPrivateNumber, Help]])
+
 interactionProperties :: [Property]
 interactionProperties =
-  [ property prop_simulationInteraction
-  , property prop_liveWorkerInteraction
-  , property prop_liveScopeInteraction
+  [ property prop_exit
+  , property prop_automaticSettlement
+  , property prop_liveSimulationReplies
   , property prop_parsePrices
   , once prop_invalidCommands
   ]
 
-prop_simulationInteraction :: Int -> Positive Integer -> Property
-prop_simulationInteraction secret (Positive delay) =
-  forAll (listOf genOrder) $ \orders ->
-    let pid = PlayerId 42
-        duration = fromRational (delay % 2)
-        initial = newEngine simulationStart duration [testPlayer pid secret]
-        ordered = foldl' (\engine order -> fst (handleRequest simulationStart pid (SubmitOrder order) engine)) initial orders
-        snapshot now engine = case snd (handleRequest now pid GetExchangeState engine) of
-          Reply value -> ExchangeSnapshot value
-        later = addUTCTime (fromInteger delay) simulationStart
-        result = Settlement (toInteger secret) 0 [PlayerResult (testPlayer pid secret) 0]
-        unread = [Help]
-        commands = [ShowPrivateNumber] ++ map PlaceOrder orders ++
-          [ShowExchange, WaitFor (fromInteger delay), ShowExchange, ShowSettlement,
-           ShowPrivateNumber, Quit] ++ unread
-        expected = [PrivateNumber (toInteger secret)] ++
-          map (OrderSubmitted . Right . OrderId) [1 .. toInteger (length orders)] ++
-          [snapshot simulationStart ordered, snapshot later ordered,
-           PlayerSettlement result, PrivateNumber (toInteger secret)]
-        ((remaining, output), settlements) = run $ runScript commands $
-          runTradingGameFor duration [(testPlayer pid secret, interactivePlayer)]
-    in conjoin [remaining === unread, output === expected, settlements === [result]]
+-- Quit/logout return distinct outcomes and leave arbitrary trailing input unread.
+prop_exit :: Bool -> [Bool] -> Positive Integer -> Property
+prop_exit quitting trailing (Positive duration) = forAll genRoster $ \roster ->
+  forAll genCommands $ \commands ->
+    let stop = if quitting then Quit else LeaveGame
+        expected = if quitting then QuitApplication else LeftGame
+        suffix = map (\b -> if b then Help else Quit) trailing
+        program = interactivePlayer >>= State.put . Just
+        (outcome, ((remaining, _), _)) = run $ State.runState Nothing $
+          runScript (commands ++ [stop] ++ suffix) $
+            runTradingGameFor (fromInteger duration) [(head roster, program)]
+    in conjoin [remaining === suffix, outcome === Just expected]
 
--- The individual worker handles only TradingGame, without Concurrent or a
--- handler inside the worker. Compare its replies with virtual execution.
-prop_liveWorkerInteraction :: Int -> Property
-prop_liveWorkerInteraction secret = forAll (listOf genOrder) $ \orders ->
-  liveProperty "interaction forwarded by individual live worker" $ do
+-- Updates and settlement are delivered while the command loop is waiting.
+prop_automaticSettlement :: Positive Integer -> Positive Integer -> Property
+prop_automaticSettlement (Positive duration) (Positive later) = forAll genRoster $ \roster ->
+  let player = head roster
+      commands = [WaitFor (fromInteger (duration + later)), Quit]
+      ((_, output), settlements) = run $ runScript commands $
+        runTradingGameFor (fromInteger duration) [(player, void interactivePlayer)]
+  in conjoin
+    [ [value | PlayerSettlement value <- output] === settlements
+    , [gamePhase value | ExchangeSnapshot value <- output] === [Trading, Resolved (privateNumber player)]
+    ]
+
+-- The same player and input produce the same command replies under pure
+-- scheduling and real threads. The live transport uses STM for shared output.
+prop_liveSimulationReplies :: Positive Integer -> Property
+prop_liveSimulationReplies (Positive duration) = forAll genRoster $ \roster ->
+  forAll genCommands $ \commands -> liveProperty "shared interactive player replies" $ do
+    let player = head roster
+        input = commands ++ [Quit]
+        initial = newEngine simulationStart (fromInteger duration) [player]
+        ((_, expected), _) = run $ runScript input $
+          runTradingGameFor (fromInteger duration) [(player, void interactivePlayer)]
     (clock, _) <- manualClock simulationStart
-    let initial = newEngine simulationStart 60 [testPlayer (PlayerId 42) secret]
-        commands = [ShowPrivateNumber] ++ map PlaceOrder orders ++ [ShowExchange, Quit, Help]
-        expected = fst $ run $ runScript commands $
-          runTradingGameFor 60 [(testPlayer (PlayerId 42) secret, interactivePlayer)]
     runtime <- newLiveRuntime clock (const (pure ())) initial
-    (actual, ()) <- runIO $ runScript commands $
-      runLivePlayer (closesAt (engineInfo initial)) runtime (testPlayer (PlayerId 42) secret, interactivePlayer)
-    pure (actual === expected)
-
--- Handle PlayerInteraction around the whole concurrent run. Synchronization
--- ensures replies have been delivered before closure cancels player workers.
-prop_liveScopeInteraction :: Int -> Property
-prop_liveScopeInteraction secret = liveProperty "outer interaction handler in live scope" $ do
-  (clock, advance) <- manualClock simulationStart
-  delivered <- newEmptyMVar
-  let player = interactivePlayer >> liftIO (putMVar delivered ())
-      config = defaultLiveConfig { liveDuration = 60 }
-      action = runIO $ runScript [ShowPrivateNumber, Quit, Help] $ runConcurrent $
-        runLiveWith clock config [(testPlayer (PlayerId 42) secret, player)]
-  Async.withAsync action $ \game -> do
-    takeMVar delivered
-    advance (addUTCTime 60 simulationStart)
-    result <- Async.wait game
-    pure (result === (([Help], [PrivateNumber (toInteger secret)]), [Settlement (toInteger secret) 0 [PlayerResult (testPlayer (PlayerId 42) secret) 0]]))
+    transport <- newTVarIO (input, [])
+    runIO $ interpret (\request -> liftIO $ atomically $ case request of
+      ReadInput -> do
+        (remaining, output) <- readTVar transport
+        case remaining of
+          [] -> error "script unexpectedly exhausted"
+          command:rest -> writeTVar transport (rest, output) >> pure command
+      SendInfo info -> modifyTVar' transport (\(remaining, output) -> (remaining, output ++ [info]))) $
+      runLivePlayer runtime (player, void interactivePlayer)
+    (remaining, actual) <- readTVarIO transport
+    pure (conjoin [remaining === [], commandReplies actual === commandReplies expected])
 
 prop_parsePrices :: Integer -> Positive Integer -> Positive Integer -> Property
 prop_parsePrices n (Positive d) (Positive quantity) =

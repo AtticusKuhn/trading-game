@@ -100,6 +100,7 @@ data Settlement = Settlement
 data TradingGame :: Effect where
   GetMyPrivateNumber :: TradingGame m Integer
   GetExchangeState :: TradingGame m ExchangeState
+  AwaitExchangeChange :: ExchangeState -> TradingGame m ExchangeState
   SubmitOrder :: LimitOrder -> TradingGame m OrderResult
   AwaitSettlement :: TradingGame m Settlement
   Wait :: NominalDiffTime -> TradingGame m ()
@@ -111,6 +112,11 @@ getMyPrivateNumber = send GetMyPrivateNumber
 
 getExchangeState :: TradingGame :< effs => Eff effs ExchangeState
 getExchangeState = send GetExchangeState
+
+-- Wait for a public change since this snapshot. Passing the snapshot avoids
+-- losing a change between rendering it and subscribing, including at closure.
+awaitExchangeChange :: TradingGame :< effs => ExchangeState -> Eff effs ExchangeState
+awaitExchangeChange = send . AwaitExchangeChange
 
 submitOrder :: TradingGame :< effs => LimitOrder -> Eff effs OrderResult
 submitOrder = send . SubmitOrder
@@ -152,6 +158,7 @@ data Decision a where
   Reply :: a -> Decision a
   ResumeAt :: UTCTime -> Decision ()
   WhenResolved :: Decision Settlement
+  WhenExchangeChanges :: ExchangeState -> Decision ExchangeState
 
 deriving instance Eq a => Eq (Decision a)
 deriving instance Show a => Show (Decision a)
@@ -202,13 +209,10 @@ handleRequest now pid request initial =
     GetMyPrivateNumber -> answer $ case find ((== pid) . playerID) (players engine) of
       Just player -> privateNumber player
       Nothing -> error "handleRequest: unknown player ID"
-    GetExchangeState -> answer ExchangeState
-      { gameInfo = engineInfo engine
-      , observedAt = now
-      , gamePhase = enginePhase engine
-      , orderBook = map snd (ownedOrders state)
-      , tradeHistory = reverse (executedTrades state)
-      }
+    GetExchangeState -> answer (exchangeSnapshot now engine)
+    AwaitExchangeChange previous
+      | exchangeChanged previous (exchangeSnapshot now engine) -> answer (exchangeSnapshot now engine)
+      | otherwise -> (engine, WhenExchangeChanges previous)
     SubmitOrder order -> case enginePhase engine of
       Resolved _ -> answer (Left GameClosed)
       Trading
@@ -223,6 +227,21 @@ handleRequest now pid request initial =
     AwaitSettlement -> case enginePhase engine of
       Resolved _ -> answer (settlementFor pid engine)
       Trading -> (engine, WhenResolved)
+
+-- Time passing alone is not a public exchange change.
+exchangeChanged :: ExchangeState -> ExchangeState -> Bool
+exchangeChanged before after =
+  gamePhase before /= gamePhase after || orderBook before /= orderBook after
+    || tradeHistory before /= tradeHistory after
+
+exchangeSnapshot :: UTCTime -> Engine -> ExchangeState
+exchangeSnapshot now engine = ExchangeState
+  { gameInfo = engineInfo engine
+  , observedAt = now
+  , gamePhase = enginePhase engine
+  , orderBook = map snd (ownedOrders (engineBook engine))
+  , tradeHistory = reverse (executedTrades (engineBook engine))
+  }
 
 -- Host-only helper; interpreters call this after resolution.
 settlementFor :: PlayerId -> Engine -> Settlement

@@ -1,6 +1,6 @@
 # Trading Game
 
-Players use the same `Eff (TradingGame ': effs) ()` programs in virtual and real
+Players use the same `Eff (TradingGame ': Concurrent ': effs) ()` programs in virtual and real
 time. Each player knows their own private number and trades contracts on the sum
 of all private numbers. The default game lasts one hour.
 
@@ -121,9 +121,10 @@ The live exchange closes at its deadline even while the terminal is waiting for
 input; the terminal remains available to inspect the resolved game until quit.
 
 The terminal is a debugging adapter in `TradingGame.Terminal`, with its
-executable in `TerminalMain.hs`. Its simulation mode advances a virtual clock
-on waits and settlement, with one active caller and a pre-seeded passive market
-maker. General multi-program simulations use the event-queue `runTradingGame`.
+executable in `TerminalMain.hs`. Its simulation mode uses the same deterministic scheduler as `runTradingGame`,
+with one active caller and a pre-seeded passive market maker. `runSimulatedPlayer`
+pauses virtual time when a session returns and preserves the engine across
+logout/rejoin. No OS threads or `runConcurrent` are used in simulation mode.
 
 ## Players and sessions
 
@@ -178,79 +179,96 @@ data PlayerInteraction :: Effect where
   SendInfo  :: PlayerInfo -> PlayerInteraction m ()
 ```
 
-`interactivePlayer` reads commands, executes them through `TradingGame`, and
-sends typed replies until `Quit` or `LeaveGame` (`logout`). Its polymorphic signature specializes to
-`Eff '[TradingGame, PlayerInteraction] ()`. It never reads stdin or prints
-anything itself. `runTerminal` is one handler; a scripted handler or a future
-web connection can implement the same operations.
-
-Players, steps, and simulator events carry the remaining effects:
+Both the terminal and web adapter run **the same `interactivePlayer`**:
 
 ```haskell
-type PlayerProgram effs = (Player, Eff (TradingGame ': effs) ())
-
-stepPlayer
-  :: Eff (TradingGame ': effs) ()
-  -> Eff effs (PlayerStep effs)
-
-runTradingGameFor
-  :: NominalDiffTime -> [PlayerProgram effs] -> Eff effs [Settlement]
-
-runLivePlayer
-  :: IOE :< effs
-  => UTCTime -> LiveRuntime -> PlayerProgram effs -> Eff effs ()
+interactivePlayer
+  :: (TradingGame :< effs, PlayerInteraction :< effs, Concurrent :< effs)
+  => Eff effs InteractionExit
 ```
 
-`stepPlayer` handles only `TradingGame`. Its continuations retain the rest of the
-effect stack. The simulator and individual live worker likewise leave other
-effects to the caller. `runLivePlayer` itself does not fork a thread.
+The command loop returns `QuitApplication` or `LeftGame`, so the terminal's
+session layer can distinguish quit from logout without implementing a second
+command loop. A scoped worker publishes the initial exchange snapshot, subsequent
+changes, and final settlement. It stops after settlement; quitting/logging out
+cancels it. The player never reads stdin or renders HTML.
 
-The high-level live runners require `Concurrent :< effs` and `IOE :< effs`:
+`runTerminal` interprets input/output for the terminal. The web's
+`runWebInteraction` interprets the same operations for HTTP command batches and
+SSE connections. HTTP order submissions supply `PlaceOrder` followed by `Quit`;
+SSE input waits for the final settlement, then supplies `Quit`. SSE output renders
+`PlayerInfo` as HTML. Connection failure cancels the player and its worker;
+reconnecting starts a fresh scope with a complete snapshot. Browser cookies bind
+all these scopes to the same existing account.
 
 ```haskell
+awaitExchangeChange
+  :: TradingGame :< effs => ExchangeState -> Eff effs ExchangeState
+```
+
+The supplied snapshot is the last one observed. The request returns immediately
+if the public book, trade history, or phase has changed; otherwise it waits.
+Passing the snapshot prevents a lost update between rendering and subscribing.
+Time passing alone and rejected orders do not count as changes. Changes can be
+coalesced for a slow consumer. After receiving a resolved snapshot, the update
+worker fetches settlement and finishes instead of subscribing again.
+
+```haskell
+type PlayerProgram effs = (Player, Eff (TradingGame ': Concurrent ': effs) ())
+
 data Concurrent :: Effect where
   WithWorkers :: [m ()] -> m a -> Concurrent m a
-
-runConcurrent
-  :: IOE :< effs
-  => Eff (Concurrent ': effs) a -> Eff effs a
 ```
 
-`WithWorkers` scopes worker lifetimes to its body. Returning, throwing, or
-cancelling the body cancels and joins the workers. Worker exceptions propagate
-to the body and cancel sibling workers. Successful workers do not terminate the
-body. The live runner uses its exchange deadline task as the body.
+`runTradingGame` handles both player effects internally, remaining pure when the
+other effects are pure. `preparePlayer` translates worker scopes into scheduling
+instructions and `stepPlayer` captures their continuations. Children keep their
+owner's player ID: they are tasks, never additional participants or accounts.
+All runnable tasks take round-robin turns at trading requests. Scope bookkeeping
+creates/cancels children without consuming a trading turn, and nested descendants
+are cancelled when their scope's body returns. Successful workers do not end the
+body. Sleeping and subscribed workers remain suspended until their event occurs.
 
-Programmatic players can still use `interactivePlayer` with scripted interaction
-handlers around the simulator or live runner. For a human terminal, compose
-`runTerminal`, `runPlayerSession`, and `terminalSession runtime` as shown in
-`TerminalMain.hs`; this keeps joining outside the in-game command loop.
+A task that never reaches a scheduling boundary cannot be preempted. An infinite
+sequence of immediate requests can prevent virtual time from advancing. Blocking
+input also blocks the simulator. These are intentional cooperative scheduling
+semantics. If all remaining tasks await changes after closure, the simulator
+reports a deadlock rather than silently dropping their continuations.
+
+Handlers outside the simulator are shared. Handlers captured inside a task
+retain their context across requests; `eff`'s local `State` is copied when a
+continuation forks, so shared simulation state should be handled outside the
+scheduler.
+
+Live execution uses `runConcurrent` and OS threads. The live player installs an
+ordinary request interpreter, allowing child workers to trade without capturing
+continuations across thread boundaries. `runLivePlayer runtime program` can run
+standalone; `runLive` owns the deadline and cancels its players at closure.
+Worker exceptions abort the body and cancel sibling workers. Returning, throwing,
+or cancelling a body cancels and joins its workers.
 
 The pinned `eff` revision has no public IO-unlifting API. `TradingGame.Concurrent`
-isolates a small bridge using `Control.Effect.Internal`: scoped actions borrow
-the current handler environment, with a separate prompt in each thread. Outer
-handlers are shared and must synchronize mutable resources when multiple
-workers use them. Nonlocal continuation capture or abort across this boundary
-is unsupported and raises an explicit IO error; install such a handler inside
-the worker action instead. Ordinary request/reply handlers, including the
-terminal adapter, work outside the scope. The bridge depends on the pinned
-library internals and should be reviewed if that dependency changes.
+uses a small internal bridge with a separate prompt in each thread. Outer live
+handlers must synchronize shared mutable resources. Nonlocal continuation capture
+or abort across that IO boundary raises an explicit error; install such handlers
+inside a worker instead. The pure scheduler also uses `eff`'s internal `Handle`
+context to sequence scoped actions, but introduces no IO/thread boundary. Review
+these two integration points when upgrading `eff`.
 
-Migration: the old `(PlayerId, program, Int)` tuple is now
-`(Player playerId name secret, program) :: PlayerProgram effs`. Secrets use
-`Integer`. `newEngine` takes `[Player]` instead of ID/secret pairs, and
-`engineSecrets` is replaced by `players`. Simulation and live entry points still
-return `Eff effs`; use `run` for pure simulations and `runIO . runConcurrent`
-for ordinary live runs.
+Use `void interactivePlayer` when supplying it as a `PlayerProgram`; session
+adapters retain its exit result. Trading-only bots need no behavioral changes,
+but explicitly annotated program stacks now include `Concurrent` after
+`TradingGame`. Use `run` for pure simulations and `runIO . runConcurrent` for
+high-level live runs.
 
 ## Shared rules and separate scheduling
 
 - `TradingGame.Core`: pure `Engine`, `advanceTo`, `handleRequest`, matching,
   snapshots, and settlement. The handler returns `Reply`, `ResumeAt`, or
-  `WhenResolved`; it does not run continuations or sleep.
-- `TradingGame.Player`: the shared `stepPlayer` evaluator and typed continuations.
+  `WhenResolved`, or `WhenExchangeChanges`; it does not run continuations or sleep.
+- `TradingGame.Player`: scope translation and the pure `stepPlayer` evaluator.
 - `TradingGame.Simulation`: the virtual event queue. Every trading request yields
-  to already runnable players. Waits beyond closure and subsequent player
+  to already runnable player tasks. Waits beyond closure and subsequent player
   activity are preserved; simulation finishes when all player activity finishes.
 - `TradingGame.Live`: concurrent player workers apply requests directly under an
   `MVar Engine` lock. A deadline task closes idle games; one shared `TMVar Engine`
@@ -319,8 +337,10 @@ The suite includes QuickCheck rule properties, QuickSpec equation discovery,
 live trace replay, concurrent order updates, manually timed players, shared
 settlement notification, idle closure, deadlines under lock contention, lock
 recovery, exception supervision, and a real-clock smoke test. Interaction
-properties use a pure scripted handler to check command/reply ordering, effect
-forwarding, waits after closure, and quitting without consuming more input.
+properties compare live and simulated replies, check automatic settlement, and
+verify quit/logout results without consuming trailing input. Scheduler properties
+check round-robin ordering, unchanged rosters, nested cancellation, local handler
+continuations, exchange notifications, and pause/resume equivalence.
 Session properties check login identity, logout, connection isolation, unknown
 names, account continuity across rejoins, command gating, and timed settlement.
 Concurrency properties check cleanup on body return, worker failure, parent
