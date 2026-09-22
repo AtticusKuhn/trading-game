@@ -5,7 +5,7 @@
 
 module TradingGame.Live where
 
-import Control.Effect (Eff, IOE, (:<), liftIO)
+import Control.Effect (Eff, IOE, (:<), interpret, liftIO)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (evaluate)
@@ -15,6 +15,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 import TradingGame.Concurrent
 import TradingGame.Core
 import TradingGame.Player
+import TradingGame.Session
 
 -- The alarm action must become ready once clockNow >= its target. Both parts
 -- must use the same nondecreasing clock. Tests can implement both with one TVar.
@@ -102,9 +103,37 @@ runExchange runtime = do
   modifyLiveEngine runtime $ \now engine ->
     let final = advanceTo now engine in pure (final, final)
 
-runLivePlayer :: IOE :< effs => UTCTime -> LiveRuntime -> Player effs -> Eff effs ()
-runLivePlayer close runtime (pid, program, _) = loop program
+-- Bind the entire inner computation to the identity selected by the outer
+-- session. Rejected sessions do not execute any part of the computation.
+-- Waits run outside the engine lock. Unlike a supervised player worker, this
+-- interpreter also supports arbitrary return values and queries after closure.
+runWithCurrentPlayer
+  :: (PlayerSession :< effs, IOE :< effs)
+  => LiveRuntime
+  -> Eff (TradingGame ': effs) a
+  -> Eff effs (Either SessionError a)
+runWithCurrentPlayer runtime action = do
+  current <- getCurrentPlayer
+  case current of
+    Nothing -> pure (Left NotLoggedIn)
+    Just pid -> do
+      roster <- liftIO (players <$> readMVar (runtimeEngine runtime))
+      if pid `notElem` map playerID roster
+        then pure (Left (UnknownPlayerId pid))
+        else Right <$> interpret (\request -> do
+          decision <- liftIO (requestLive runtime pid request)
+          case decision of
+            Reply value -> pure value
+            ResumeAt target -> liftIO $
+              clockAlarm (runtimeClock runtime) target >>= atomically
+            WhenResolved -> do
+              final <- liftIO (runExchange runtime)
+              pure (settlementFor (engineTotal final) pid (engineBook final))) action
+
+runLivePlayer :: IOE :< effs => UTCTime -> LiveRuntime -> PlayerProgram effs -> Eff effs ()
+runLivePlayer close runtime (player, program) = loop program
   where
+    pid = playerID player
     finished = readTMVar (runtimeFinal runtime)
     loop current = do
       step <- stepPlayer current
@@ -125,27 +154,27 @@ runLivePlayer close runtime (pid, program, _) = loop program
               final <- liftIO (atomically finished)
               loop (resume (settlementFor (engineTotal final) pid (engineBook final)))
 
-runLive :: (IOE :< effs, Concurrent :< effs) => [Player effs] -> Eff effs [Settlement]
+runLive :: (IOE :< effs, Concurrent :< effs) => [PlayerProgram effs] -> Eff effs [Settlement]
 runLive = runLiveFor 3600
 
-runLiveFor :: (IOE :< effs, Concurrent :< effs) => NominalDiffTime -> [Player effs] -> Eff effs [Settlement]
-runLiveFor duration players = do
+runLiveFor :: (IOE :< effs, Concurrent :< effs) => NominalDiffTime -> [PlayerProgram effs] -> Eff effs [Settlement]
+runLiveFor duration programs = do
   clock <- liftIO newLiveClock
-  runLiveWith clock defaultLiveConfig { liveDuration = duration } players
+  runLiveWith clock defaultLiveConfig { liveDuration = duration } programs
 
 -- Like runTradingGame, results follow input order. Ends at closure even when
 -- players finish early or wait beyond it. There is no guarantee that a player's
 -- continuation after awaitSettlement runs. Workers are trusted, interruptible
 -- Haskell computations; this is not isolation for untrusted/noninterruptible code.
 -- Any worker/exchange exception aborts the run and cleans up the other workers.
-runLiveWith :: (IOE :< effs, Concurrent :< effs) => LiveClock -> LiveConfig -> [Player effs] -> Eff effs [Settlement]
-runLiveWith clock config players = engineSettlements <$> runLiveEngineWith clock config players
+runLiveWith :: (IOE :< effs, Concurrent :< effs) => LiveClock -> LiveConfig -> [PlayerProgram effs] -> Eff effs [Settlement]
+runLiveWith clock config programs = engineSettlements <$> runLiveEngineWith clock config programs
 
-runLiveEngineWith :: (IOE :< effs, Concurrent :< effs) => LiveClock -> LiveConfig -> [Player effs] -> Eff effs Engine
-runLiveEngineWith clock config players = do
+runLiveEngineWith :: (IOE :< effs, Concurrent :< effs) => LiveClock -> LiveConfig -> [PlayerProgram effs] -> Eff effs Engine
+runLiveEngineWith clock config programs = do
   start <- liftIO (clockNow clock)
   let initial = newEngine start (liveDuration config)
-        [(pid, toInteger secret) | (pid, _, secret) <- players]
+        (map fst programs)
   runtime <- liftIO (newLiveRuntime clock (onLiveEvent config) initial)
   let worker = runLivePlayer (closesAt (engineInfo initial)) runtime
-  withWorkers (map worker players) (liftIO (runExchange runtime))
+  withWorkers (map worker programs) (liftIO (runExchange runtime))

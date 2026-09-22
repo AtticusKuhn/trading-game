@@ -19,25 +19,25 @@ simulationStart :: UTCTime
 simulationStart = UTCTime (fromGregorian 2000 1 1) 0
 
 -- Supply unique player IDs. Settlements follow the input player order.
-runTradingGame :: [Player effs] -> Eff effs [Settlement]
+runTradingGame :: [PlayerProgram effs] -> Eff effs [Settlement]
 runTradingGame = runTradingGameFor 3600
 
-runTradingGameFor :: NominalDiffTime -> [Player effs] -> Eff effs [Settlement]
+runTradingGameFor :: NominalDiffTime -> [PlayerProgram effs] -> Eff effs [Settlement]
 runTradingGameFor = runTradingGameAt simulationStart
 
-runTradingGameAt :: UTCTime -> NominalDiffTime -> [Player effs] -> Eff effs [Settlement]
+runTradingGameAt :: UTCTime -> NominalDiffTime -> [PlayerProgram effs] -> Eff effs [Settlement]
 runTradingGameAt start duration = fmap engineSettlements . simulatePlayers start duration
 
-runTradingGameAt' :: UTCTime -> NominalDiffTime -> [Player effs] -> Eff effs Exchange
+runTradingGameAt' :: UTCTime -> NominalDiffTime -> [PlayerProgram effs] -> Eff effs Exchange
 runTradingGameAt' start duration = fmap engineBook . simulatePlayers start duration
 
-simulatePlayers :: UTCTime -> NominalDiffTime -> [Player effs] -> Eff effs Engine
-simulatePlayers start duration players =
+simulatePlayers :: UTCTime -> NominalDiffTime -> [PlayerProgram effs] -> Eff effs Engine
+simulatePlayers start duration programs =
   let initial = newEngine start duration
-        [(pid, toInteger secret) | (pid, _, secret) <- players]
+        (map fst programs)
       -- Stable sorting keeps closure ahead of wake-ups at the deadline.
       events = (closesAt (engineInfo initial), CloseExchange) :
-        [(start, ResumePlayer pid program) | (pid, program, _) <- players]
+        [(start, ResumePlayer (playerID player) program) | (player, program) <- programs]
   in simulate initial (sortOn fst events)
 
 -- Each request yields to players already runnable at the same virtual time.

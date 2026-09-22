@@ -145,3 +145,140 @@ Please implement this.
 Remember to add a small debugging endpoint with a terminal handler, so that the end-user can 
 run the terminal version to debug, but remember that the terminal handler will only be one way 
 to handle the effect (with over a web-connection being a possible future extension direction).
+
+
+
+Imagine that I wanted to change the⠂rules slightly so that at certain points, the secret number of a random player is⠈revealed publically (representing a market event, or new market    ⠄
+  information).
+How should I architect this? 
+Should I add an ability to callback for the player in `TradingGame :: Effect`, i.e. `callbackOnNewMarketEvent :: (MarketEvent -> )`? Or should I 
+leave it to the player to poll for new market events `getListOfMarketEvents`? What would be cleanest? 
+How would the architecture of the project have to change? What would be the ramifications?  
+Don't make any changes yet.
+
+
+I'm thinking about how I want to design a prototype of the web version.
+Let's say that I want to allow for multiple human players to join the webUI.
+How should I architect it? 
+I just want to keep it simple. 
+Should each player be randomly assigned an ID on join? 
+Or should each player choose an ID via a dialog on join? 
+How should the ID be stored, and can HTMX support that? 
+Don't implement anything yet.
+No changes yet.
+Just prototyping for now.
+I'm thinking about changing the player to be something like
+```haskell
+data Player = Player {
+    playerID :: PlayerID
+    displayName :: String
+    privateNumber :: Integer
+}
+data Engine = Engine
+  { engineInfo :: GameInfo
+  , players :: [Player]
+  , enginePhase :: GamePhase
+  , engineBook :: !Exchange
+  } deriving (Eq, Show)
+```
+
+And having a new effect
+
+```haskell
+data LoginResult = SuccesfulLogin | InvalidName
+
+data PlayerSession :: Effect where
+    JoinGameAsPlayer :: String -> PlayerSession m LoginResult
+    Logout :: PlayerSession m LogoutResult
+    GetCurrentPlayer :: PlayerSession m (Maybe PlayerId)
+```
+
+but I don't know yet.
+Don't worry about account security yet; this is still just a prototype.
+How can I model that once a player has joined a game that a player can start running `TradingGame` effects? Should I have a constructor of
+  `PlayerSession` that's like `runCommand`, but only works if the player is logged in? How should I architect this? Because there are two layers:
+  first player must join game, and second player must run in-game commands. The player session is the outer layer, and the running in-game
+  sending orders is the inner layer.
+The engine must launch with a list of players. The list of players is a static constant throughout the game,
+and does not change. If a player select the same name, they should join as the same player, not create a new player.
+
+```haskell
+runWithCurrentPlayer
+    :: (PlayerSession :< effs, IOE :< effs)
+    => LiveRuntime
+    -> Eff (TradingGame ': effs) a
+    -> Eff effs (Either SessionError a)
+```
+
+
+
+Can you please edit the game to track the idea of players/sessions?
+Here's a sketch of what I mean:
+
+```haskell
+data Player = Player {
+    playerID :: PlayerID
+    displayName :: String
+    privateNumber :: Integer
+}
+data Engine = Engine
+  { engineInfo :: GameInfo
+  , players :: [Player]
+  , enginePhase :: GamePhase
+  , engineBook :: !Exchange
+  } deriving (Eq, Show)
+```
+
+The engine should launch with a list of players. The list of players is a static constant throughout the game,
+and does not change. If a player rejoins with the same name, they should join as the same player, not create a new player.
+
+And having a new effect
+
+```haskell
+data PlayerSession :: Effect where
+    JoinGameAsPlayer :: String -> PlayerSession m LoginResult
+    Logout :: PlayerSession m LogoutResult
+    GetCurrentPlayer :: PlayerSession m (Maybe PlayerId)
+```
+
+And use it with 
+
+
+```haskell
+runWithCurrentPlayer
+    :: (PlayerSession :< effs, IOE :< effs)
+    => LiveRuntime
+    -> Eff (TradingGame ': effs) a
+    -> Eff effs (Either SessionError a)
+```
+
+Please edit the terminal UI so that the player is first in the `PlayerSession` layer (i.e. must join with a name), and
+once they have joined with a name, then they can run commands.
+
+There are two layers:
+ first player must join game, and second player must run in-game commands. The player session is the outer layer, and the running in-game
+  sending orders is the inner layer.
+
+Please make this refactor.
+
+
+I currently have the effect `PlayerSession :: Effect`. What would happen if I added a 
+constructor `RunCommandAsCurrentPlayer`, for example:
+
+```haskell
+data PlayerSession :: Effect where
+    JoinGameAsPlayer :: String -> PlayerSession m LoginResult
+    Logout :: PlayerSession m LogoutResult
+    GetCurrentPlayer :: PlayerSession m (Maybe PlayerId)
+    RunAsCurrentPlayer
+    ::  TradingGame :< m
+    -> PlayerSession m (Either SessionError a)
+```
+
+Would this be a good or bad design decision? What would be the ramifications? 
+
+
+Can you please implement a web UI prototype? 
+It doesn't exist yet.
+Please make a simple debugging applicaton. Do not remove the terminal entrypoint.
+If you need to add BlazeHTML/HTMX to the nix flake, you may do so.

@@ -14,6 +14,7 @@ import Data.Ratio ((%))
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 import GHC.Conc (ThreadStatus(..), BlockReason(..), threadStatus)
 import Test.QuickCheck hiding (replay, total)
+import TestSupport (testPlayer)
 import TradingGame
 
 -- Positive gaps preserve distinct IDs and ordered wakeups even while shrinking.
@@ -50,7 +51,7 @@ scenarioEngine scenario =
   let ((first, firstSecret), (second, secondSecret)) = scenarioPlayers scenario
       (_, _, duration) = scenarioTimes scenario
   in newEngine (scenarioStart scenario) duration
-       [(first, toInteger firstSecret), (second, toInteger secondSecret)]
+       [testPlayer first firstSecret, testPlayer second secondSecret]
 
 -- Generate valid orders, including negative/fractional prices, with shrinking.
 newtype ValidOrder = ValidOrder (Bool, Integer, Positive Integer, Positive Integer)
@@ -170,7 +171,7 @@ hasSettlementWait pid = any $ \event -> case event of
   _ -> False
 
 prop_concurrentPlayers :: Scenario -> ValidOrder -> Property
-prop_concurrentPlayers scenario generated = liveProperty "concurrent players, waits, settlement and replay" $ do
+prop_concurrentPlayers scenario generated = liveProperty "concurrent programs, waits, settlement and replay" $ do
   let start = scenarioStart scenario
       ((buyerId, buyerSecret), (sellerId, sellerSecret)) = scenarioPlayers scenario
       (sellerWake, buyerWake, duration) = scenarioTimes scenario
@@ -195,10 +196,10 @@ prop_concurrentPlayers scenario generated = liveProperty "concurrent players, wa
         void (submitOrder order { orderSide = Sell })
         void awaitSettlement
       -- Reverse ID order to check that settlements follow the input order.
-      players = [(sellerId, seller, sellerSecret), (buyerId, buyer, buyerSecret)]
-      initial = newEngine start duration [(sellerId, toInteger sellerSecret), (buyerId, toInteger buyerSecret)]
+      programs = [(testPlayer sellerId sellerSecret, seller), (testPlayer buyerId buyerSecret, buyer)]
+      initial = newEngine start duration [testPlayer sellerId sellerSecret, testPlayer buyerId buyerSecret]
       config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
-  Async.withAsync (runIO (runConcurrent (runLiveEngineWith clock config players))) $ \game -> do
+  Async.withAsync (runIO (runConcurrent (runLiveEngineWith clock config programs))) $ \game -> do
     awaitTrace events (\trace -> hasWait buyerId trace && hasWait sellerId trace)
     advance (addUTCTime sellerWake start)
     awaitTrace events (hasSettlementWait sellerId)
@@ -223,7 +224,7 @@ prop_stopsAtClosure scenario (Positive overrun) = liveProperty "idle closure and
   events <- newTVarIO []
   let sleeper = wait (duration + fromInteger overrun) >> error "live runner resumed a wait beyond closure"
       config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
-  Async.withAsync (runIO (runConcurrent (runLiveWith clock config [(first, sleeper, firstSecret), (second, pure (), secondSecret)]))) $ \game -> do
+  Async.withAsync (runIO (runConcurrent (runLiveWith clock config [(testPlayer first firstSecret, sleeper), (testPlayer second secondSecret, pure ())]))) $ \game -> do
     awaitTrace events (hasWait first)
     advance (addUTCTime duration start)
     final <- Async.wait game
@@ -269,12 +270,12 @@ prop_settlementBroadcast scenario generated = liveProperty "shared settlement no
   events <- newTVarIO []
   runtime <- newLiveRuntime clock (record events) initial
   let close = closesAt (engineInfo initial)
-      player pid side secret expected = (pid, do
+      player pid side secret expected = (testPlayer pid secret, do
         void (submitOrder order { orderSide = side })
         result <- awaitSettlement
-        unless (result == Settlement total expected) (error "wrong shared settlement"), secret)
-      players = [player buyer Buy buyerSecret payoff, player seller Sell sellerSecret (-payoff)]
-  Async.withAsync (Async.mapConcurrently_ (runIO . runLivePlayer close runtime) players) $ \workers -> do
+        unless (result == Settlement total expected) (error "wrong shared settlement"))
+      programs = [player buyer Buy buyerSecret payoff, player seller Sell sellerSecret (-payoff)]
+  Async.withAsync (Async.mapConcurrently_ (runIO . runLivePlayer close runtime) programs) $ \workers -> do
     awaitTrace events (\trace -> all (`hasSettlementWait` trace) [buyer, seller])
     advance close
     final <- runExchange runtime
@@ -342,7 +343,7 @@ prop_exchangeFailureSupervision scenario = liveProperty "exchange failure superv
   (clock, _) <- manualClock (scenarioStart scenario)
   let config = defaultLiveConfig
         { liveDuration = duration, onLiveEvent = \_ -> throwIO (userError "trace failed") }
-  result <- try (runIO (runConcurrent (runLiveWith clock config [(pid, void getExchangeState, secret)])))
+  result <- try (runIO (runConcurrent (runLiveWith clock config [(testPlayer pid secret, void getExchangeState)])))
   pure $ counterexample "exchange exception propagated" $
     property (either (isTestFailure "trace failed") (const False) result)
 
@@ -352,5 +353,5 @@ prop_realClock = forAllShrink arbitrary shrink $ \(identifier, secret) ->
   forAllShrink (chooseInteger (1, 10000)) (filter (> 0) . shrink) $ \micros ->
     liveProperty "real clock settlement" $ do
       result <- runIO $ runConcurrent $ runLiveFor (fromRational (micros % 1000000))
-        [(PlayerId identifier, void awaitSettlement, secret)]
+        [(testPlayer (PlayerId identifier) secret, void awaitSettlement)]
       pure (result === [Settlement (toInteger secret) 0])

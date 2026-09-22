@@ -136,7 +136,7 @@
             ${project.tests}/bin/trading-game-tests +RTS -N2 -RTS > "$out"
           '';
           terminal = project.pkgs.runCommand "trading-game-terminal-check" { } ''
-            printf 'private\nbuy 11 2\nbook\nsettlement\nquit\n' | \
+            printf 'join alice\nprivate\nbuy 11 2\nlogout\njoin alice\nbook\nsettlement\nquit\n' | \
               ${project.terminal}/bin/trading-game-terminal sim > "$out"
             grep -q 'Order accepted' "$out"
             grep -q 'Resolved sum: 10; your payoff: -2' "$out"

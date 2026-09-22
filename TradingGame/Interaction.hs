@@ -16,6 +16,7 @@ import TradingGame.Core
 -- how to obtain commands and deliver information (terminal, script, web, ...).
 data PlayerCommand
   = Quit
+  | LeaveGame
   | ShowPrivateNumber
   | ShowExchange
   | PlaceOrder LimitOrder
@@ -45,6 +46,7 @@ sendInfo = send . SendInfo
 execute :: (TradingGame :< effs, PlayerInteraction :< effs) => PlayerCommand -> Eff effs ()
 execute command = case command of
   Quit -> pure ()
+  LeaveGame -> pure ()
   ShowPrivateNumber -> getMyPrivateNumber >>= sendInfo . PrivateNumber
   ShowExchange -> getExchangeState >>= sendInfo . ExchangeSnapshot
   PlaceOrder order -> submitOrder order >>= sendInfo . OrderSubmitted
@@ -60,4 +62,5 @@ interactivePlayer = loop
       command <- readInput
       case command of
         Quit -> pure ()
+        LeaveGame -> pure ()
         cmd -> execute cmd >> loop

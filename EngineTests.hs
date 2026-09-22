@@ -44,6 +44,7 @@ prop_closure = forAll genEngine $ \engine ->
       [ advanceTo later closed === closed
       , enginePhase closed === Resolved (engineTotal engine)
       , ownedOrders (engineBook closed) === []
+      , players closed === players engine
       , accounts (engineBook closed) === accounts (engineBook engine)
       , executedTrades (engineBook closed) === executedTrades (engineBook engine)
       , handleRequest deadline (PlayerId 1) (SubmitOrder order) engine
@@ -70,7 +71,7 @@ prop_invalidOrder = forAll genEngine $ \engine ->
 -- Relative and absolute waits agree and only change the engine through expiry.
 prop_waits :: Property
 prop_waits = forAll genEngine $ \engine ->
-  forAll (elements (map fst (engineSecrets engine))) $ \pid ->
+  forAll (elements (map playerID (players engine))) $ \pid ->
     forAllShrink arbitrary shrink $ \(NonNegative elapsed, seconds) ->
       let now = addUTCTime (fromInteger elapsed) (opensAt (engineInfo engine))
           target = addUTCTime (fromInteger seconds) now

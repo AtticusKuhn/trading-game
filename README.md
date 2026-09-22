@@ -11,29 +11,30 @@ import Control.Effect (run, runIO)
 import Control.Monad (void)
 import TradingGame
 
-players :: [Player effs]
-players =
-  [ (PlayerId 42, void (submitOrder (LimitOrder Buy  (Price 5) 2)), 3)
-  , (PlayerId (-7), void (submitOrder (LimitOrder Sell (Price 5) 2)), 7)
+programs :: [PlayerProgram effs]
+programs =
+  [ (Player (PlayerId 42) "alice" 3, void (submitOrder (LimitOrder Buy  (Price 5) 2)))
+  , (Player (PlayerId (-7)) "bob" 7, void (submitOrder (LimitOrder Sell (Price 5) 2)))
   ]
 
 -- Pure; advances virtual time directly to the next event.
 simulated :: [Settlement]
-simulated = run (runTradingGameFor 10 players)
+simulated = run (runTradingGameFor 10 programs)
 
 -- IO; closes after ten seconds of elapsed real time.
 live :: IO [Settlement]
-live = runIO (runConcurrent (runLiveFor 10 players))
+live = runIO (runConcurrent (runLiveFor 10 programs))
 ```
 
 `runTradingGame` and `runLive` use the default one-hour duration. All settlement
-lists follow the input player order. Supply at least one player, with unique IDs.
+lists follow the input player order. Supply at least one player, with unique IDs and nonblank, unique display names.
 Nonpositive durations close immediately.
 
 ## Terminal prototype
 
 Run against a passive player offering ten contracts at a bid of 9 and an ask of
-11. Your player can read its own private number with `private`.
+11. Join as `alice` first, then read your private number with `private`.
+The fixed demo roster contains `alice` and `market-maker`.
 
 ```sh
 # Virtual time; waiting and settlement advance the simulation immediately.
@@ -46,6 +47,7 @@ nix run path:.#terminal -- live 60
 Commands:
 
 ```text
+join alice
 private
 book
 buy 11 2
@@ -53,20 +55,64 @@ sell 9 1
 wait 5
 settlement
 help
+logout
+join alice
 quit
 ```
 
 Prices and seconds accept integers, exact decimals, and fractions such as `3/2`.
 Quantities must be positive integers. Invalid input prints an error and retries;
-EOF acts as `quit`. `settlement` waits for closure. In simulation mode, quitting
-finishes your program and lets virtual time advance to closure. In live mode,
-quitting ends your player, but the session still waits for its deadline. The
-terminal prints your final settlement when the runner returns.
+EOF acts as `quit`. `logout` returns to the session prompt; `quit` exits the
+terminal. `settlement` waits for closure and prints the current player's payoff.
+The live exchange closes at its deadline even while the terminal is waiting for
+input; the terminal remains available to inspect the resolved game until quit.
 
-The terminal is a debugging adapter, implemented in `TradingGame.Terminal`, with
-its executable in `TerminalMain.hs`. A blocking terminal read can pause the
-simulator; pure scripted handlers avoid this when testing. The terminal adapter
-is intended for one human player per session.
+The terminal is a debugging adapter in `TradingGame.Terminal`, with its
+executable in `TerminalMain.hs`. Its simulation mode advances a virtual clock
+on waits and settlement, with one active caller and a pre-seeded passive market
+maker. General multi-program simulations use the event-queue `runTradingGame`.
+
+## Players and sessions
+
+`Player` is a host-only record containing `playerID :: PlayerId`,
+`displayName :: String`, and `privateNumber :: Integer`. `newEngine` accepts a
+fixed `[Player]`, stored as `players`; trading and session changes preserve it.
+Public exchange snapshots do not include the roster or other players' secrets.
+
+```haskell
+data PlayerSession :: Effect where
+  JoinGameAsPlayer :: String -> PlayerSession m LoginResult
+  Logout :: PlayerSession m LogoutResult
+  GetCurrentPlayer :: PlayerSession m (Maybe PlayerId)
+
+runPlayerSession :: [Player] -> Eff (PlayerSession ': effs) a -> Eff effs a
+
+runWithCurrentPlayer
+  :: (PlayerSession :< effs, IOE :< effs)
+  => LiveRuntime
+  -> Eff (TradingGame ': effs) a
+  -> Eff effs (Either SessionError a)
+```
+
+Install one `runPlayerSession (players initialEngine)` handler per connection.
+It starts logged out. Names match exactly and case-sensitively; unknown names
+return `UnknownPlayerName` and never create a player. Login returns
+`Right playerID`; repeated login as the same player is idempotent. Changing
+players requires logout first. Logout returns `Right ()`, or `Left NotLoggedIn`
+if already logged out. Failed logins leave the session unchanged.
+
+The session is the outer layer. `runWithCurrentPlayer runtime action` checks
+login and runtime membership before executing any part of the inner action,
+then binds that action to the selected player. It returns `Left NotLoggedIn` or
+`Left (UnknownPlayerId pid)` for invalid sessions. Rejoining retains the same
+private number, orders, positions, and settlement. Names are identity selectors
+for this trusted demo, not authentication credentials.
+
+`terminalSession` owns the join/logout loop and invokes `runWithCurrentPlayer`
+only after successful login. The live terminal runs `runExchange` as a scoped
+background worker so closure happens even while logged out. The interpreter's
+settlement request can also drive deadline closure itself; concurrent callers
+share the same engine and final publication.
 
 ## Player interaction and effect composition
 
@@ -80,7 +126,7 @@ data PlayerInteraction :: Effect where
 ```
 
 `interactivePlayer` reads commands, executes them through `TradingGame`, and
-sends typed replies until `Quit`. Its polymorphic signature specializes to
+sends typed replies until `Quit` or `LeaveGame` (`logout`). Its polymorphic signature specializes to
 `Eff '[TradingGame, PlayerInteraction] ()`. It never reads stdin or prints
 anything itself. `runTerminal` is one handler; a scripted handler or a future
 web connection can implement the same operations.
@@ -88,18 +134,18 @@ web connection can implement the same operations.
 Players, steps, and simulator events carry the remaining effects:
 
 ```haskell
-type Player effs = (PlayerId, Eff (TradingGame ': effs) (), Int)
+type PlayerProgram effs = (Player, Eff (TradingGame ': effs) ())
 
 stepPlayer
   :: Eff (TradingGame ': effs) ()
   -> Eff effs (PlayerStep effs)
 
 runTradingGameFor
-  :: NominalDiffTime -> [Player effs] -> Eff effs [Settlement]
+  :: NominalDiffTime -> [PlayerProgram effs] -> Eff effs [Settlement]
 
 runLivePlayer
   :: IOE :< effs
-  => UTCTime -> LiveRuntime -> Player effs -> Eff effs ()
+  => UTCTime -> LiveRuntime -> PlayerProgram effs -> Eff effs ()
 ```
 
 `stepPlayer` handles only `TradingGame`. Its continuations retain the rest of the
@@ -122,21 +168,10 @@ cancelling the body cancels and joins the workers. Worker exceptions propagate
 to the body and cancel sibling workers. Successful workers do not terminate the
 body. The live runner uses its exchange deadline task as the body.
 
-The caller can handle interaction around the whole runner:
-
-```haskell
--- The player effect stack is inferred separately in each expression.
-simulatedTerminal :: IO [Settlement]
-simulatedTerminal = runIO $ runTerminal $
-  runTradingGameFor 60 [(PlayerId 1, interactivePlayer, 3)]
-
-liveTerminal :: IO [Settlement]
-liveTerminal = runIO $ runTerminal $ runConcurrent $
-  runLiveFor 60 [(PlayerId 1, interactivePlayer, 3)]
-```
-
-These examples additionally import `TradingGame.Terminal (runTerminal)`.
-Handlers need not all be installed inside individual workers.
+Programmatic players can still use `interactivePlayer` with scripted interaction
+handlers around the simulator or live runner. For a human terminal, compose
+`runTerminal`, `runPlayerSession`, and `terminalSession runtime` as shown in
+`TerminalMain.hs`; this keeps joining outside the in-game command loop.
 
 The pinned `eff` revision has no public IO-unlifting API. `TradingGame.Concurrent`
 isolates a small bridge using `Control.Effect.Internal`: scoped actions borrow
@@ -148,10 +183,12 @@ the worker action instead. Ordinary request/reply handlers, including the
 terminal adapter, work outside the scope. The bridge depends on the pinned
 library internals and should be reviewed if that dependency changes.
 
-Migration from the original API: `Player` now takes an effect-list parameter;
-all simulation entry points return `Eff effs`, so wrap effect-free simulations
-in `run`. High-level live entry points also return `Eff effs`; wrap ordinary live
-runs in `runIO . runConcurrent`, as above.
+Migration: the old `(PlayerId, program, Int)` tuple is now
+`(Player playerId name secret, program) :: PlayerProgram effs`. Secrets use
+`Integer`. `newEngine` takes `[Player]` instead of ID/secret pairs, and
+`engineSecrets` is replaced by `players`. Simulation and live entry points still
+return `Eff effs`; use `run` for pure simulations and `runIO . runConcurrent`
+for ordinary live runs.
 
 ## Shared rules and separate scheduling
 
@@ -166,7 +203,7 @@ runs in `runIO . runConcurrent`, as above.
   `MVar Engine` lock. A deadline task closes idle games; one shared `TMVar Engine`
   publishes the final state to settlement waiters.
 
-`TradingGame` re-exports these modules, `Interaction`, and `Concurrent`. The engine,
+`TradingGame` re-exports these modules, `Interaction`, `Session`, and `Concurrent`. The engine,
 low-level runtime API, and trace hook are host-only. Interaction replies expose
 only the caller's private number, public snapshots, order results, and the
 caller's settlement.
@@ -193,7 +230,7 @@ configured = do
   clock <- newLiveClock
   runIO $ runConcurrent $ runLiveWith clock
     defaultLiveConfig { liveDuration = 10 }
-    players
+    programs
 ```
 
 `LiveClock` injects both the current time and an STM deadline signal. The real
@@ -230,6 +267,8 @@ settlement notification, idle closure, deadlines under lock contention, lock
 recovery, exception supervision, and a real-clock smoke test. Interaction
 properties use a pure scripted handler to check command/reply ordering, effect
 forwarding, waits after closure, and quitting without consuming more input.
+Session properties check login identity, logout, connection isolation, unknown
+names, account continuity across rejoins, command gating, and timed settlement.
 Concurrency properties check cleanup on body return, worker failure, parent
 cancellation, nested scopes, and the nonlocal-control boundary. Nix also builds
 and smoke-tests the terminal executable.

@@ -8,10 +8,19 @@
 module TradingGame.Core where
 
 import Control.Effect (Eff, Effect, (:<), send)
-import Data.List (sortOn)
+import Data.Char (isSpace)
+import Data.List (find, nub, sortOn)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 
 newtype PlayerId = PlayerId Integer deriving (Eq, Ord, Show)
+
+-- Host-only identity: never include the roster in public exchange snapshots.
+data Player = Player
+  { playerID :: PlayerId
+  , displayName :: String
+  , privateNumber :: Integer
+  } deriving (Eq, Show)
+
 newtype OrderId = OrderId Integer deriving (Eq, Ord, Show)
 newtype Price = Price Rational deriving (Eq, Ord, Show)
 
@@ -26,11 +35,11 @@ data LimitOrder = LimitOrder
 
 data Side = Buy | Sell deriving (Eq, Show)
 
--- Only the trusted host receives this setup. Require N >= 1 and unique IDs.
+-- Only the trusted host receives this setup. Require N >= 1, unique IDs and unique nonblank names.
 -- Each p_i is fixed at the start. The game closes exactly 3600 seconds later.
 -- Never expose this setup to a player computation.
 data GameSetup = GameSetup
-  { privateNumbers :: [(PlayerId, Integer)]
+  { setupPlayers :: [Player]
   , startTime :: UTCTime
   } deriving (Eq)
 
@@ -126,7 +135,7 @@ data Exchange = Exchange
 -- engine must be nondecreasing and no earlier than opensAt.
 data Engine = Engine
   { engineInfo :: GameInfo
-  , engineSecrets :: [(PlayerId, Integer)]
+  , players :: [Player]
   , enginePhase :: GamePhase
   , engineBook :: !Exchange
   } deriving (Eq, Show)
@@ -141,23 +150,30 @@ data Decision a where
 deriving instance Eq a => Eq (Decision a)
 deriving instance Show a => Show (Decision a)
 
--- Require at least one player and unique IDs, as for GameSetup.
+-- Names are exact, case-sensitive identities. Reject ambiguous rosters up front.
 -- Nonpositive durations produce a game that is closed at its start.
-newEngine :: UTCTime -> NominalDiffTime -> [(PlayerId, Integer)] -> Engine
-newEngine start duration secrets = Engine
-  { engineInfo = GameInfo (length secrets) start (addUTCTime (max 0 duration) start)
-  , engineSecrets = secrets
-  , enginePhase = Trading
-  , engineBook = Exchange 1 [] [] [(pid, (0, 0)) | (pid, _) <- secrets]
-  }
+newEngine :: UTCTime -> NominalDiffTime -> [Player] -> Engine
+newEngine start duration roster
+  | null roster = error "newEngine: empty player roster"
+  | length (nub (map playerID roster)) /= length roster =
+      error "newEngine: duplicate player IDs"
+  | length (nub (map displayName roster)) /= length roster =
+      error "newEngine: duplicate display names"
+  | any (all isSpace . displayName) roster = error "newEngine: empty display name"
+  | otherwise = Engine
+      { engineInfo = GameInfo (length roster) start (addUTCTime (max 0 duration) start)
+      , players = roster
+      , enginePhase = Trading
+      , engineBook = Exchange 1 [] [] [(playerID player, (0, 0)) | player <- roster]
+      }
 
 engineTotal :: Engine -> Integer
-engineTotal = sum . map snd . engineSecrets
+engineTotal = sum . map privateNumber . players
 
 engineSettlements :: Engine -> [Settlement]
 engineSettlements engine =
-  [settlementFor (engineTotal engine) pid (engineBook engine)
-  | (pid, _) <- engineSecrets engine]
+  [settlementFor (engineTotal engine) (playerID player) (engineBook engine)
+  | player <- players engine]
 
 advanceTo :: UTCTime -> Engine -> Engine
 advanceTo now engine = case enginePhase engine of
@@ -177,8 +193,8 @@ handleRequest now pid request initial =
       answer :: b -> (Engine, Decision b)
       answer value = (engine, Reply value)
   in case request of
-    GetMyPrivateNumber -> answer $ case lookup pid (engineSecrets engine) of
-      Just secret -> secret
+    GetMyPrivateNumber -> answer $ case find ((== pid) . playerID) (players engine) of
+      Just player -> privateNumber player
       Nothing -> error "handleRequest: unknown player ID"
     GetExchangeState -> answer ExchangeState
       { gameInfo = engineInfo engine

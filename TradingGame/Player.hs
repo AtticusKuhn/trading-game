@@ -7,7 +7,7 @@ module TradingGame.Player where
 import Control.Effect (Eff, control0, handle)
 import TradingGame.Core
 
-type Player effs = (PlayerId, Eff (TradingGame ': effs) (), Int)
+type PlayerProgram effs = (Player, Eff (TradingGame ': effs) ())
 
 -- Each runner uses the same evaluator. Continuations retain player-local state.
 data PlayerStep effs where

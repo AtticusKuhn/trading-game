@@ -3,15 +3,57 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TypeOperators #-}
 
-module TradingGame.Terminal (runTerminal, parseCommand, renderInfo, commandHelp) where
+module TradingGame.Terminal
+  ( runTerminal, terminalSession, parseCommand, renderInfo, commandHelp ) where
 
 import Control.Effect (Eff, IOE, (:<), interpret, liftIO)
-import Data.Char (isDigit)
+import Control.Monad (void)
+import Data.Char (isDigit, isSpace)
 import Data.Ratio ((%), numerator, denominator)
 import System.IO (hFlush, isEOF, stdout)
 import Text.Read (readMaybe)
 import TradingGame.Core
 import TradingGame.Interaction
+import TradingGame.Live (LiveRuntime, runWithCurrentPlayer)
+import TradingGame.Session
+
+-- The join loop has only session/interaction effects. TradingGame is installed
+-- inside a successful login, so logged-out input cannot submit orders.
+terminalSession
+  :: (PlayerSession :< effs, PlayerInteraction :< effs, IOE :< effs)
+  => LiveRuntime -> Eff effs ()
+terminalSession runtime = joinLoop
+  where
+    joinLoop = do
+      line <- liftIO $ do
+        putStr "session> "
+        hFlush stdout
+        eof <- isEOF
+        if eof then pure "quit" else getLine
+      case words line of
+        ["quit"] -> pure ()
+        ["help"] -> liftIO (putStrLn "Join with: join NAME. Exit with: quit.") >> joinLoop
+        "join":_:_ -> do
+          -- Preserve spaces within a name; the separator after 'join' is syntax.
+          let name = dropWhile isSpace (drop 4 (dropWhile isSpace line))
+          result <- joinGameAsPlayer name
+          case result of
+            Left problem -> liftIO (print problem) >> joinLoop
+            Right _ -> do
+              liftIO (putStrLn ("Joined as " ++ name ++ "."))
+              outcome <- runWithCurrentPlayer runtime gameLoop
+              void logout
+              case outcome of
+                Left problem -> liftIO (print problem) >> joinLoop
+                Right LeaveGame -> joinLoop
+                Right _ -> pure ()
+        _ -> liftIO (putStrLn "Join first with: join NAME (or quit).") >> joinLoop
+    gameLoop = do
+      command <- readInput
+      case command of
+        Quit -> pure Quit
+        LeaveGame -> pure LeaveGame
+        other -> execute other >> gameLoop
 
 runTerminal :: IOE :< effs => Eff (PlayerInteraction ': effs) a -> Eff effs a
 runTerminal = interpret $ \request -> case request of
@@ -31,14 +73,15 @@ runTerminal = interpret $ \request -> case request of
 commandHelp :: String
 commandHelp = unlines
   [ "Commands: buy PRICE QUANTITY | sell PRICE QUANTITY"
-  , "          private | book | wait SECONDS | settlement | help | quit"
+  , "          private | book | wait SECONDS | settlement | help | logout | quit"
   , "Prices and seconds accept integers, decimals, or fractions (e.g. 3/2)."
-  , "settlement waits for closure; quit (or EOF) ends this player's program."
+  , "settlement waits for closure; logout returns to joining; quit (or EOF) exits."
   ]
 
 parseCommand :: String -> Either String PlayerCommand
 parseCommand line = case words line of
   ["quit"] -> Right Quit
+  ["logout"] -> Right LeaveGame
   ["private"] -> Right ShowPrivateNumber
   ["book"] -> Right ShowExchange
   ["settlement"] -> Right ShowSettlement

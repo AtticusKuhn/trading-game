@@ -15,7 +15,7 @@ import Data.Ratio ((%))
 import Data.Time.Clock (addUTCTime)
 import Test.QuickCheck
 import LiveTests (manualClock, liveProperty)
-import TestSupport (genOrder)
+import TestSupport (genOrder, testPlayer)
 import TradingGame
 import TradingGame.Terminal (parseCommand)
 
@@ -51,7 +51,7 @@ prop_simulationInteraction secret (Positive delay) =
   forAll (listOf genOrder) $ \orders ->
     let pid = PlayerId 42
         duration = fromRational (delay % 2)
-        initial = newEngine simulationStart duration [(pid, toInteger secret)]
+        initial = newEngine simulationStart duration [testPlayer pid secret]
         ordered = foldl' (\engine order -> fst (handleRequest simulationStart pid (SubmitOrder order) engine)) initial orders
         snapshot now engine = case snd (handleRequest now pid GetExchangeState engine) of
           Reply value -> ExchangeSnapshot value
@@ -66,7 +66,7 @@ prop_simulationInteraction secret (Positive delay) =
           [snapshot simulationStart ordered, snapshot later ordered,
            PlayerSettlement result, PrivateNumber (toInteger secret)]
         ((remaining, output), settlements) = run $ runScript commands $
-          runTradingGameFor duration [(pid, interactivePlayer, secret)]
+          runTradingGameFor duration [(testPlayer pid secret, interactivePlayer)]
     in conjoin [remaining === unread, output === expected, settlements === [result]]
 
 -- The individual worker handles only TradingGame, without Concurrent or a
@@ -75,13 +75,13 @@ prop_liveWorkerInteraction :: Int -> Property
 prop_liveWorkerInteraction secret = forAll (listOf genOrder) $ \orders ->
   liveProperty "interaction forwarded by individual live worker" $ do
     (clock, _) <- manualClock simulationStart
-    let initial = newEngine simulationStart 60 [(PlayerId 42, toInteger secret)]
+    let initial = newEngine simulationStart 60 [testPlayer (PlayerId 42) secret]
         commands = [ShowPrivateNumber] ++ map PlaceOrder orders ++ [ShowExchange, Quit, Help]
         expected = fst $ run $ runScript commands $
-          runTradingGameFor 60 [(PlayerId 42, interactivePlayer, secret)]
+          runTradingGameFor 60 [(testPlayer (PlayerId 42) secret, interactivePlayer)]
     runtime <- newLiveRuntime clock (const (pure ())) initial
     (actual, ()) <- runIO $ runScript commands $
-      runLivePlayer (closesAt (engineInfo initial)) runtime (PlayerId 42, interactivePlayer, secret)
+      runLivePlayer (closesAt (engineInfo initial)) runtime (testPlayer (PlayerId 42) secret, interactivePlayer)
     pure (actual === expected)
 
 -- Handle PlayerInteraction around the whole concurrent run. Synchronization
@@ -93,7 +93,7 @@ prop_liveScopeInteraction secret = liveProperty "outer interaction handler in li
   let player = interactivePlayer >> liftIO (putMVar delivered ())
       config = defaultLiveConfig { liveDuration = 60 }
       action = runIO $ runScript [ShowPrivateNumber, Quit, Help] $ runConcurrent $
-        runLiveWith clock config [(PlayerId 42, player, secret)]
+        runLiveWith clock config [(testPlayer (PlayerId 42) secret, player)]
   Async.withAsync action $ \game -> do
     takeMVar delivered
     advance (addUTCTime 60 simulationStart)

@@ -22,17 +22,27 @@ genOrder = do
   quantity <- chooseInteger (1, 10)
   pure (LimitOrder side (Price (numerator % denominator)) quantity)
 
-genPlayers :: Gen [(PlayerId, Eff '[TradingGame] (), Int)]
+genPlayers :: Gen [PlayerProgram '[]]
 genPlayers = do
   count <- chooseInt (1, 8)
   ids <- take count <$> shuffle (map PlayerId [-20..20])
-  mapM (\pid -> (,,) pid <$> genTradingGame <*> chooseInt (-100, 100)) ids
+  mapM (\pid -> (,) <$> (testPlayer pid <$> chooseInt (-100, 100)) <*> genTradingGame) ids
 
 -- A reachable pre-closure engine, built through the public request handler.
 genEngine :: Gen Engine
 genEngine = do
-  secrets <- vectorOf 3 (chooseInteger (-100, 100))
-  orders <- listOf ((,) <$> elements [PlayerId 1, PlayerId 2, PlayerId 3] <*> genOrder)
-  let initial = newEngine simulationStart 60 (zip (map PlayerId [1..3]) secrets)
+  roster <- genRoster
+  orders <- listOf ((,) <$> elements (map playerID roster) <*> genOrder)
+  let initial = newEngine simulationStart 60 roster
   pure (foldl (\engine (pid, order) ->
     fst (handleRequest simulationStart pid (SubmitOrder order) engine)) initial orders)
+
+genRoster :: Gen [Player]
+genRoster = do
+  count <- chooseInt (1, 8)
+  ids <- take count <$> shuffle (map PlayerId [-20..20])
+  mapM (\pid -> Player pid <$> (((show pid ++ ":") ++) <$> arbitrary) <*> arbitrary) ids
+
+-- Stable names for generated host identities.
+testPlayer :: PlayerId -> Int -> Player
+testPlayer pid secret = Player pid (show pid) (toInteger secret)
