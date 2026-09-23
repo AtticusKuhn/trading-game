@@ -11,7 +11,6 @@ import qualified Control.Effect.State.Strict as State
 import Control.Monad (void)
 import Data.ByteString.Builder (toLazyByteString)
 import Data.List (find, nub, sort)
-import qualified Data.Map.Strict as Map
 import Data.Ratio ((%))
 import Data.Time.Clock (addUTCTime, diffUTCTime)
 import LiveTests (liveProperty, manualClock)
@@ -144,18 +143,17 @@ prop_idleStream = forAll (genRevealEngine `suchThat` (not . null . future)) $ \e
         chunk = toLazyByteString (sseHtml "exchange" (exchangeView expected Nothing))
     (clock, advance) <- manualClock start
     runtime <- newLiveRuntime clock (const (pure ())) engine
-    sessions <- newTVarIO Map.empty
-    chunks <- newTVarIO []
-    let game = WebGame runtime sessions (players engine) []
-        (_, _, stream) = responseToStream (eventStream game (BrowserSession player))
-        write value = atomically (modifyTVar' chunks (++ [toLazyByteString value]))
-    Async.withAsync (runExchange runtime) $ \_ ->
-      Async.withAsync (stream (\body -> body write (pure ()))) $ \_ -> do
-        atomically (readTVar chunks >>= check . not . null)
-        advance time
-        atomically (readTVar chunks >>= check . elem chunk)
-        snapshot <- handleLiveRequest runtime (playerID player) GetExchangeState
-        pure (snapshot === expected)
+    withWebGame runtime (players engine) [] $ \game -> do
+      chunks <- newTVarIO []
+      let (_, _, stream) = responseToStream (eventStream game (BrowserSession player))
+          write value = atomically (modifyTVar' chunks (++ [toLazyByteString value]))
+      Async.withAsync (runExchange runtime) $ \_ ->
+        Async.withAsync (stream (\body -> body write (pure ()))) $ \_ -> do
+          atomically (readTVar chunks >>= check . not . null)
+          advance time
+          atomically (readTVar chunks >>= check . elem chunk)
+          snapshot <- handleLiveRequest runtime (playerID player) GetExchangeState
+          pure (snapshot === expected)
   where future engine = filter ((> opensAt (engineInfo engine)) . fst) (pendingReveals engine)
 
 -- Statistical distribution property: every roster slot has equal weight;

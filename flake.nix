@@ -154,7 +154,7 @@
         let project = projectFor system;
         in {
           default = project.pkgs.mkShell {
-            packages = [ project.ghc project.pkgs.cloc ];
+            packages = [ project.ghc project.pkgs.cloc project.pkgs.awscli2 ];
           };
         });
 

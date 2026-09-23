@@ -3,9 +3,11 @@
 
 module WebTests (webProperties, post, orderFields) where
 
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.Async (mapConcurrently)
 import qualified Control.Concurrent.Async as Async
 import Control.Concurrent.MVar (readMVar)
+import Control.Exception (bracket)
 import Control.Concurrent.STM
 import qualified Data.ByteString.Char8 as B
 import Data.ByteString.Builder (toLazyByteString)
@@ -44,8 +46,7 @@ newWebGame duration = do
   roster <- sequence
     [Player (PlayerId n) name <$> randomRIO (1, 9) | (n, name) <- zip [1..] webPlayerNames]
   runtime <- newLiveRuntime clock (const (pure ())) (newEngine start duration roster)
-  sessions <- newTVarIO Map.empty
-  pure (WebGame runtime sessions roster [])
+  newWebGameFromRuntime runtime roster []
 
 post :: B.ByteString -> RequestHeaders -> [(B.ByteString, B.ByteString)] -> SRequest
 post path headers fields = SRequest
@@ -64,8 +65,7 @@ orderFields order =
 
 -- Arbitrary valid orders cannot change any exchange state without a session.
 prop_requiresSession :: Property
-prop_requiresSession = forAll genOrder $ \order -> ioProperty $ do
-  game <- newWebGame 3600
+prop_requiresSession = forAll genOrder $ \order -> ioProperty $ bracket (newWebGame 3600) closeWebGame $ \game -> do
   before <- readMVar (runtimeEngine (webRuntime game))
   response <- runSession (srequest (post "/orders" [] (orderFields order))) (webApplication game)
   after <- readMVar (runtimeEngine (webRuntime game))
@@ -74,8 +74,7 @@ prop_requiresSession = forAll genOrder $ \order -> ioProperty $ do
 -- HTTP parsing and session binding agree with the pure engine for arbitrary
 -- orders, even with a forged player ID in the form. Another account is untouched.
 prop_boundOrder :: Property
-prop_boundOrder = forAll genOrder $ \order -> ioProperty $ do
-  game <- newWebGame 3600
+prop_boundOrder = forAll genOrder $ \order -> ioProperty $ bracket (newWebGame 3600) closeWebGame $ \game -> do
   Right token <- joinWebPlayer game "alice"
   Right _ <- joinWebPlayer game "bob"
   initial <- readMVar (runtimeEngine (webRuntime game))
@@ -90,8 +89,7 @@ prop_boundOrder = forAll genOrder $ \order -> ioProperty $ do
 -- identity, unknown names fail, and the complete engine stays unchanged.
 prop_joins :: Property
 prop_joins = forAllShrink (listOf1 (elements (map T.pack webPlayerNames ++ ["unknown", "Alice", " alice "])))
-  (shrinkList (const [])) $ \names -> ioProperty $ do
-    game <- newWebGame 3600
+  (shrinkList (const [])) $ \names -> ioProperty $ bracket (newWebGame 3600) closeWebGame $ \game -> do
     before <- readMVar (runtimeEngine (webRuntime game))
     outcomes <- mapConcurrently (joinWebPlayer game) names
     sessions <- readTVarIO (webSessions game)
@@ -148,8 +146,7 @@ prop_settlementTable = forAll genEngine $ \engine ->
 -- an arbitrary order; the cookie always selects the named existing player.
 prop_rejoin :: Property
 prop_rejoin = forAll (elements webPlayerNames) $ \name ->
-  forAll genOrder $ \order -> forAll arbitrary $ \sameBrowser -> ioProperty $ do
-    game <- newWebGame 3600
+  forAll genOrder $ \order -> forAll arbitrary $ \sameBrowser -> ioProperty $ bracket (newWebGame 3600) closeWebGame $ \game -> do
     Right token <- joinWebPlayer game (T.pack name)
     let headers = [(hCookie, "trading-session=" <> token)]
     _ <- runSession (srequest (post "/orders" headers (orderFields order))) (webApplication game)
@@ -173,8 +170,7 @@ prop_rejoin = forAll (elements webPlayerNames) $ \name ->
 prop_unknownPlayer :: Property
 prop_unknownPlayer = forAllShrink (arbitrary `suchThat` (`notElem` webPlayerNames))
   (filter (`notElem` webPlayerNames) . shrink) $ \name ->
-  forAll arbitrary $ \loggedIn -> ioProperty $ do
-    game <- newWebGame 3600
+  forAll arbitrary $ \loggedIn -> ioProperty $ bracket (newWebGame 3600) closeWebGame $ \game -> do
     Right token <- joinWebPlayer game "alice"
     before <- readMVar (runtimeEngine (webRuntime game))
     sessions <- readTVarIO (webSessions game)
@@ -190,32 +186,33 @@ prop_unknownPlayer = forAllShrink (arbitrary `suchThat` (`notElem` webPlayerName
       ]
 
 -- An idle HTTP stream receives closure from the shared player's worker, sends
--- its final view, and terminates without another browser command.
+-- its final view, and terminates without another browser command. Reconnecting
+-- after closure replays the final result without starting a new player.
 prop_streamClosure :: Property
 prop_streamClosure = forAll genEngine $ \initial -> forAll (elements (players initial)) $ \player ->
   liveProperty "SSE automatic settlement" $ do
     (clock, advance) <- manualClock (opensAt (engineInfo initial))
     runtime <- newLiveRuntime clock (const (pure ())) initial
-    sessions <- newTVarIO Map.empty
-    chunks <- newTVarIO []
-    let game = WebGame runtime sessions (players initial) []
-        (_, _, stream) = responseToStream (eventStream game (BrowserSession player))
-        write chunk = atomically (modifyTVar' chunks (++ [toLazyByteString chunk]))
-    Async.withAsync (stream (\body -> body write (pure ()))) $ \connection -> do
-      atomically (readTVar chunks >>= check . not . null)
-      advance (closesAt (engineInfo initial))
-      void (runExchange runtime)
-      Async.wait connection
-      wire <- LBS.concat <$> readTVarIO chunks
-      final <- atomically (tryReadTMVar (runtimeFinal runtime))
-      pure $ conjoin
-        [ property ("event: closed\ndata: done\n\n" `LBS.isSuffixOf` wire)
-        , property ("Player results" `B.isInfixOf` LBS.toStrict wire)
-        , property (isJust final)
-        ]
+    withWebGame runtime (players initial) [] $ \game -> do
+      chunks <- newTVarIO []
+      let (_, _, stream) = responseToStream (eventStream game (BrowserSession player))
+          write chunk = atomically (modifyTVar' chunks (++ [toLazyByteString chunk]))
+      Async.withAsync (stream (\body -> body write (pure ()))) $ \connection -> do
+        atomically (readTVar chunks >>= check . not . null)
+        advance (closesAt (engineInfo initial))
+        void (runExchange runtime)
+        Async.wait connection
+        stream (\body -> body write (pure ()))
+        wire <- LBS.concat <$> readTVarIO chunks
+        final <- atomically (tryReadTMVar (runtimeFinal runtime))
+        pure $ conjoin
+          [ property ("event: closed\ndata: done\n\n" `LBS.isSuffixOf` wire)
+          , property ("Player results" `B.isInfixOf` LBS.toStrict wire)
+          , property (isJust final)
+          ]
 
 webProperties :: [Property]
-webProperties = [prop_portfolioTable, prop_streamPortfolios, prop_instrumentViews, prop_disabledHttpOrder, prop_orderForm, prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer, prop_streamClosure]
+webProperties = [property prop_playerQueues, prop_portfolioTable, prop_streamPortfolios, prop_instrumentViews, prop_disabledHttpOrder, prop_orderForm, prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer, prop_streamClosure]
 
 -- A connected observer receives the complete updated portfolio table after an order.
 prop_streamPortfolios :: Property
@@ -224,18 +221,17 @@ prop_streamPortfolios = forAll genEngine $ \initial -> forAll genOrder $ \order 
     liveProperty "SSE public portfolios" $ do
       (clock, _) <- manualClock simulationStart
       runtime <- newLiveRuntime clock (const (pure ())) initial
-      sessions <- newTVarIO Map.empty
-      chunks <- newTVarIO []
-      let game = WebGame runtime sessions (players initial) []
-          (_, _, stream) = responseToStream (eventStream game (BrowserSession viewer))
-          write chunk = atomically (modifyTVar' chunks (++ [toLazyByteString chunk]))
-      Async.withAsync (stream (\body -> body write (pure ()))) $ \_ -> do
-        atomically (readTVar chunks >>= check . not . null)
-        _ <- handleLiveRequest runtime (playerID trader) (SubmitOrder order)
-        snapshot <- handleLiveRequest runtime (playerID viewer) GetExchangeState
-        let expected = toLazyByteString (sseHtml "exchange" (exchangeView snapshot Nothing))
-        atomically (readTVar chunks >>= check . elem expected)
-        pure (property ("id=\"portfolios\"" `B.isInfixOf` LBS.toStrict expected))
+      withWebGame runtime (players initial) [] $ \game -> do
+        chunks <- newTVarIO []
+        let (_, _, stream) = responseToStream (eventStream game (BrowserSession viewer))
+            write chunk = atomically (modifyTVar' chunks (++ [toLazyByteString chunk]))
+        Async.withAsync (stream (\body -> body write (pure ()))) $ \_ -> do
+          atomically (readTVar chunks >>= check . not . null)
+          _ <- handleLiveRequest runtime (playerID trader) (SubmitOrder order)
+          snapshot <- handleLiveRequest runtime (playerID viewer) GetExchangeState
+          let expected = toLazyByteString (sseHtml "exchange" (exchangeView snapshot Nothing))
+          atomically (readTVar chunks >>= check . elem expected)
+          pure (property ("id=\"portfolios\"" `B.isInfixOf` LBS.toStrict expected))
 
 -- The public table preserves names (including HTML metacharacters), quantities,
 -- and exact cash amounts for every roster member, with any instrument selection.
@@ -287,12 +283,41 @@ prop_disabledHttpOrder = forAll genRoster $ \roster -> forAll genOrder $ \order 
           player = head roster
       (clock, _) <- manualClock simulationStart
       runtime <- newLiveRuntime clock (const (pure ())) initial
-      sessions <- newTVarIO Map.empty
-      let game = WebGame runtime sessions roster []
-      Right token <- joinWebPlayer game (T.pack (displayName player))
-      response <- runSession (srequest (post "/orders" [(hCookie, "trading-session=" <> token)] (orderFields order))) (webApplication game)
-      after <- readMVar (runtimeEngine runtime)
-      pure $ conjoin [after === initial, property ("disabled" `B.isInfixOf` LBS.toStrict (simpleBody response))]
+      withWebGame runtime roster [] $ \game -> do
+        Right token <- joinWebPlayer game (T.pack (displayName player))
+        response <- runSession (srequest (post "/orders" [(hCookie, "trading-session=" <> token)] (orderFields order))) (webApplication game)
+        after <- readMVar (runtimeEngine runtime)
+        pure $ conjoin [after === initial, property ("disabled" `B.isInfixOf` LBS.toStrict (simpleBody response))]
 
 prop_orderForm :: Property
 prop_orderForm = forAll genOrder $ \order -> parseOrderForm (orderFields order) === Right order
+
+-- Arbitrary HTTP orders from repeated logins stay on each human's one worker.
+-- Sequential and concurrent callers both get the reply to their own order.
+prop_playerQueues :: Bool -> Property
+prop_playerQueues concurrent = forAll genEngine $ \initial ->
+  forAllShrink (listOf1 ((,) <$> elements (players initial) <*> genOrder)) (shrinkList (const [])) $ \orders ->
+    liveProperty "persistent HTTP player queues" $ do
+      (clock, _) <- manualClock simulationStart
+      handled <- newTVarIO []
+      let trace (RequestHandled _ pid (SubmitOrder order) (Reply (Right oid))) = do
+            tid <- myThreadId
+            atomically (modifyTVar' handled ((pid, order, oid, tid):))
+          trace _ = pure ()
+      runtime <- newLiveRuntime clock trace initial
+      (checks, workers) <- withWebGame runtime (players initial) [] $ \game -> do
+        let submit (player, order) = do
+              Right token <- joinWebPlayer game (T.pack (displayName player))
+              response <- runSession (srequest (post "/orders"
+                [(hCookie, "trading-session=" <> token)] (orderFields order))) (webApplication game)
+              records <- readTVarIO handled
+              let matches (_, _, OrderId oid, _) = B.pack ("Order #" ++ show oid ++ " accepted.")
+                    `B.isInfixOf` LBS.toStrict (simpleBody response)
+                  actual = [(pid, submitted, tid) | record@(pid, submitted, _, tid) <- records, matches record]
+                  worker = webWorker (webPlayer game (BrowserSession player))
+              pure (actual === [(playerID player, order, Async.asyncThreadId worker)])
+        replies <- (if concurrent then mapConcurrently else mapM) submit orders
+        records <- readTVarIO handled
+        pure (conjoin ((length records === length orders) : replies), map webWorker (Map.elems (webHumans game)))
+      stopped <- mapM Async.poll workers
+      pure (checks .&&. property (all isJust stopped))

@@ -176,8 +176,7 @@ prop_httpIsolation :: Property
 prop_httpIsolation = forAllShrink (humans <$> genConfig) shrinkConfig $ \config -> forAll genOrder $ \order ->
   liveProperty "HTTP game isolation" $ do
     (clock, _) <- manualClock (gameStart config)
-    withGameManager clock $ \manager -> do
-      lobby <- newWebLobby manager 3600
+    withGameManager clock $ \manager -> withWebLobby manager 3600 $ \lobby -> do
       Right first <- manage manager (createNewGame config)
       Right second <- manage manager (createNewGame config)
       let path gid suffix = T.encodeUtf8 (gamePath gid <> suffix)
@@ -193,8 +192,7 @@ prop_playerTypes :: Property
 prop_playerTypes = forAllShrink genConfig shrinkConfig $ \config ->
   forAll (elements (gameRoster config)) $ \entry -> liveProperty "human roster selection" $ do
     (clock, _) <- manualClock (gameStart config)
-    withGameManager clock $ \manager -> do
-      lobby <- newWebLobby manager 3600
+    withGameManager clock $ \manager -> withWebLobby manager 3600 $ \lobby -> do
       Right gid <- manage manager (createNewGame config)
       joined <- runSession (srequest (post (T.encodeUtf8 (gamePath gid <> "/join")) []
         [("name", T.encodeUtf8 (T.pack (rosterName entry)))])) (lobbyApplication lobby)
@@ -206,8 +204,7 @@ prop_futureHTTP :: Property
 prop_futureHTTP = forAllShrink genConfig shrinkConfig $ \config ->
   forAll (arbitrary :: Gen (Positive Integer)) $ \(Positive lead) -> liveProperty "future HTTP gates" $ do
     (clock, _) <- manualClock (addUTCTime (negate (fromInteger lead)) (gameStart config))
-    withGameManager clock $ \manager -> do
-      lobby <- newWebLobby manager 3600
+    withGameManager clock $ \manager -> withWebLobby manager 3600 $ \lobby -> do
       created <- runSession (srequest (post "/games" [] (configFields config))) (lobbyApplication lobby)
       [summary] <- manage manager listAllGames
       let base = T.encodeUtf8 (gamePath (summaryId summary))

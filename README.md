@@ -125,6 +125,9 @@ profiles/private windows for different players within one game. Names select
 identities in this trusted local demo; they are not authentication credentials.
 The server binds to loopback.
 
+For the public Lightsail instance, updates, and shutdown instructions, see
+[the deployment guide](deploy/lightsail/README.md).
+
 The game page shows your private number, open orders, recent trades, public
 portfolios, and final results. The portfolio table has one row per player and
 columns for each enabled instrument and cash, and updates live with the exchange.
