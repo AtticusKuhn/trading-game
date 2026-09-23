@@ -8,6 +8,38 @@ orders in different instruments never match. Accounts share cash but track a
 separate integer position in each instrument. Final payoff is
 `cash + sum (position[instrument] * resolution[instrument])`.
 
+Market events reveal private numbers during trading. By default an N-player
+game has N reveals, at `start + (end - start) * i / (N + 1)` for `i = 1..N`.
+The host samples a player independently for each event, uniformly from the full
+fixed roster, including bots and humans who never join. Sampling is with
+replacement: players and values can repeat, and a value held by multiple players
+has their combined probability. Targets are fixed at creation and kept private.
+Public snapshots contain all `GameInfo.revealTimes` and the chronological
+`ExchangeState.revealedNumbers`, preserving duplicates.
+
+The creation form offers the default schedule or custom UTC timestamps, one per
+line. Each line is one event; an empty custom schedule disables reveals.
+Times must be at or after the start and strictly before the end; duplicates are
+allowed and inputs are sorted chronologically. Web and terminal exchange updates
+show the revealed numbers and full schedule. SSE publishes reveals even when
+nobody is trading. Late starts or clock jumps publish every event already due.
+
+`awaitUntilNextReveal` (`AwaitUntilNextReveal`) waits for the first event strictly
+after the call, returning `Just number`, or immediately returns `Nothing` when
+none remain. It broadcasts the same value to every waiter. Simultaneous events
+are published together; the wait returns the first value in that group. Read the
+snapshot to obtain the complete history. A delayed live waiter still receives
+the event it originally awaited, even if later events have already occurred.
+
+Randomness stays in the host adapter (`TradingGame.Reveals.sampleRevealTargets`),
+outside the pure engine. `newEngineWithReveals enabled start duration roster plan`
+accepts a host-only `[(UTCTime, PlayerId)]` plan. The older low-level constructors
+use an empty plan. The default simulator samples with a fixed seed for repeatable
+runs; `runTradingGameWithReveals enabled start duration plan programs` accepts an
+explicit plan for tests/replay. Live runners sample fresh targets unless given
+`defaultLiveConfig { liveRevealPlan = Just plan }`; `Just []` disables reveals.
+`runSimulatedPlayer` preserves pending events across sessions.
+
 Median averages the two middle values for an even roster. `StdDev` is population
 standard deviation, rounded to the nearest six decimal places (ties up). All
 other resolutions are exact rationals, and standard deviation is calculated
@@ -105,6 +137,7 @@ data NewGameConfig = NewGameConfig
   , gameEnd :: UTCTime
   , gameRoster :: [RosterEntry]
   , gameInstruments :: Set Instrument
+  , gameRevealTimes :: Maybe [UTCTime]
   }
 
 data RosterEntry = RosterEntry
@@ -116,6 +149,9 @@ data PlayerType = HumanPlayer | RandomTradingBot | MarketMakingBot
 ```
 
 `defaultNewGameConfig start end roster` enables all instruments. Override
+`gameRevealTimes` with `Just times` for a custom schedule (`Just []` for none);
+`Nothing` selects the default. `configuredRevealTimes` returns the full sorted
+public schedule. Override
 `gameInstruments` with a `Set Instrument` to choose a subset. Standalone engines
 use `newEngineWithInstruments`; simulations accept the same set through
 `runTradingGameWithInstruments enabled start duration programs`, and live
@@ -197,7 +233,8 @@ logout/rejoin. No OS threads or `runConcurrent` are used in simulation mode.
 `Player` is a record kept private until settlement, containing `playerID :: PlayerId`,
 `displayName :: String`, and `privateNumber :: Integer`. `newEngine` accepts a
 fixed `[Player]`, stored as `players`; trading and session changes preserve it.
-Public exchange snapshots do not include the roster or other players' secrets.
+Public exchange snapshots include scheduled revealed values, without identities,
+and keep all future reveal values private.
 
 ```haskell
 data PlayerSession :: Effect where
@@ -273,7 +310,7 @@ awaitExchangeChange
 ```
 
 The supplied snapshot is the last one observed. The request returns immediately
-if the public book, trade history, or phase has changed; otherwise it waits.
+if the public book, trade history, revealed numbers, or phase has changed; otherwise it waits.
 Passing the snapshot prevents a lost update between rendering and subscribing.
 Time passing alone and rejected orders do not count as changes. Changes can be
 coalesced for a slow consumer. After receiving a resolved snapshot, the update
@@ -331,7 +368,7 @@ high-level live runs.
 
 - `TradingGame.Core`: pure `Engine`, `advanceTo`, `handleRequest`, matching,
   snapshots, and settlement. The handler returns `Reply`, `ResumeAt`, or
-  `WhenResolved`, or `WhenExchangeChanges`; it does not run continuations or sleep.
+  `WhenResolved`, `WhenRevealed`, or `WhenExchangeChanges`; it does not run continuations or sleep.
 - `TradingGame.Player`: scope translation and the pure `stepPlayer` evaluator.
 - `TradingGame.Simulation`: the virtual event queue. Every trading request yields
   to already runnable player tasks. Waits beyond closure and subsequent player

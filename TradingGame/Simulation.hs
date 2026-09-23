@@ -10,14 +10,16 @@ import TradingGame.Concurrent (Concurrent)
 import Data.Set (Set)
 import Data.List (sortOn, partition)
 import Data.Time.Calendar (fromGregorian)
-import Data.Time.Clock (UTCTime(..), NominalDiffTime)
+import Data.Time.Clock (UTCTime(..), NominalDiffTime, addUTCTime)
+import System.Random (mkStdGen)
 import TradingGame.Core
 import TradingGame.Player
+import TradingGame.Reveals
 
 -- Scope IDs are scheduler identities, never game participants.
 type ScopeId = Integer
 data Activity effs = Activity PlayerId [ScopeId] (Task effs)
-data Event effs = CloseExchange | ResumeTask (Activity effs)
+data Event effs = CloseExchange | RevealNumbers | ResumeTask (Activity effs)
 data Subscription effs = Subscription ExchangeState (ExchangeState -> Activity effs)
 
 simulationStart :: UTCTime
@@ -45,9 +47,21 @@ runTradingGameWithInstruments enabled start duration =
 
 simulatePlayersWithInstruments :: Set Instrument -> UTCTime -> NominalDiffTime -> [PlayerProgram effs] -> Eff effs Engine
 simulatePlayersWithInstruments enabled start duration programs =
-  let initial = newEngineWithInstruments enabled start duration (map fst programs)
+  let roster = map fst programs
+      plan = sampleRevealTargets (mkStdGen 0) roster
+        (defaultRevealTimes start (addUTCTime duration start) (length roster))
+  in simulatePlayersWithReveals enabled start duration plan programs
+
+-- Explicit plans allow deterministic replay of any host's sampled game.
+runTradingGameWithReveals :: Set Instrument -> UTCTime -> NominalDiffTime -> [(UTCTime, PlayerId)] -> [PlayerProgram effs] -> Eff effs [Settlement]
+runTradingGameWithReveals enabled start duration plan =
+  fmap engineSettlements . simulatePlayersWithReveals enabled start duration plan
+
+simulatePlayersWithReveals :: Set Instrument -> UTCTime -> NominalDiffTime -> [(UTCTime, PlayerId)] -> [PlayerProgram effs] -> Eff effs Engine
+simulatePlayersWithReveals enabled start duration plan programs =
+  let initial = newEngineWithReveals enabled start duration (map fst programs) plan
       -- Stable sorting keeps closure ahead of wake-ups at the deadline.
-      events = (closesAt (engineInfo initial), CloseExchange) :
+      events = (closesAt (engineInfo initial), CloseExchange) : revealEvents start initial ++
         [(start, ResumeTask (Activity (playerID player) [] (preparePlayer program)))
         | (player, program) <- programs]
   in fst <$> simulate True start initial 0 [] (sortOn fst events)
@@ -61,12 +75,15 @@ runSimulatedPlayer
 runSimulatedPlayer now engine pid program = do
   (result, (final, stoppedAt)) <- State.runState Nothing $
     let task = preparePlayer (lift program >>= State.put . Just)
-        events = [(max now (closesAt (engineInfo engine)), CloseExchange),
-                  (now, ResumeTask (Activity pid [] task))]
+        events = (max now (closesAt (engineInfo engine)), CloseExchange) : revealEvents now engine ++
+                  [(now, ResumeTask (Activity pid [] task))]
     in simulate False now engine 0 [] (sortOn fst events)
   case result of
     Just value -> pure (stoppedAt, final, value)
     Nothing -> error "runSimulatedPlayer: player exited without returning"
+
+revealEvents :: UTCTime -> Engine -> [(UTCTime, Event effs)]
+revealEvents now engine = [(max now time, RevealNumbers) | (time, _) <- pendingReveals engine]
 
 -- Every trading request yields to tasks already runnable at the same time.
 -- Scope bookkeeping does not consume a turn. Nothing preempts a computation
@@ -76,6 +93,7 @@ simulate closeWhenIdle now engine _ [] events
   | not closeWhenIdle && all onlyClosure events = pure (engine, now)
   where
     onlyClosure (_, CloseExchange) = True
+    onlyClosure (_, RevealNumbers) = True
     onlyClosure _ = False
 simulate _ now engine _ [] [] = pure (engine, now)
 simulate _ _ _ _ (_:_) [] = error "runTradingGame: all remaining tasks await exchange changes after closure"
@@ -103,6 +121,7 @@ simulate closeWhenIdle _ engine nextScope subscriptions ((now, event) : pending)
               scope:outer ->
                 let survives (Activity _ ancestry _) = scope `notElem` ancestry
                     keepEvent (_, CloseExchange) = True
+                    keepEvent (_, RevealNumbers) = True
                     keepEvent (_, ResumeTask task) = survives task
                     keepSubscription (Subscription previous k) = survives (k previous)
                 in runTask fresh (filter keepSubscription waiting) (filter keepEvent events)
@@ -114,8 +133,10 @@ simulate closeWhenIdle _ engine nextScope subscriptions ((now, event) : pending)
                 ResumeAt target -> schedule updated target (resume ())
                 WhenResolved -> schedule updated (closesAt (engineInfo updated))
                   (send (TradingRequest AwaitSettlement) >>= resume)
+                WhenRevealed target value -> schedule updated target (resume (Just value))
                 WhenExchangeChanges previous -> continue updated fresh
                   (waiting ++ [Subscription previous (activity . resume)]) events
   in case event of
     CloseExchange -> continue current nextScope subscriptions pending
+    RevealNumbers -> continue current nextScope subscriptions pending
     ResumeTask task -> runTask nextScope subscriptions pending task

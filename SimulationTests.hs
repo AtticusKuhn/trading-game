@@ -48,11 +48,14 @@ prop_cancelDescendants (Positive early) (Positive gap) value = forAll genRoster 
       nested = withWorkers [wait later >> mark] (void awaitSettlement >> mark)
       subscribed = getExchangeState >>= awaitExchangeChange >> mark
       program = do
-        result <- withWorkers [nested, subscribed] (wait (fromInteger early) >> pure value)
+        result <- withWorkers [nested, subscribed, void awaitUntilNextReveal >> mark]
+          (wait (fromInteger early) >> pure value)
         wait later
         State.modify (result:)
       (trace, _) = run $ State.runState [] $
-        runTradingGameFor later [(head roster, program)]
+        runTradingGameWithReveals allInstruments simulationStart later
+          [(Data.Time.Clock.addUTCTime ((fromInteger early + later) / 2) simulationStart,
+            playerID (head roster))] [(head roster, program)]
   in trace === [value]
 
 -- Captured worker continuations retain handlers installed at the spawn site.
@@ -65,7 +68,7 @@ prop_localHandlers initial values (Positive duration) = forAll genRoster $ \rost
         State.modify @[Integer] (local:)) values
       program = void $ State.runState initial $ withWorkers [worker] (wait (fromInteger duration))
       (trace, _) = run $ State.runState [] $
-        runTradingGameFor (fromInteger duration) [(head roster, program)]
+        runTradingGameWithReveals allInstruments simulationStart (fromInteger duration) [] [(head roster, program)]
   in trace === reverse (tail (scanl (+) initial values))
 
 -- A sleeping command loop still receives both an order update and closure.
@@ -82,7 +85,7 @@ prop_updates (Positive gap) = forAll genRoster $ \roster -> forAll genOrder $ \o
           Resolved _ -> pure ()
       producer = wait spacing >> submitOrder order >> wait duration
       program = withWorkers [getExchangeState >>= watch] producer
-      (trace, _) = run $ State.runState [] $ runTradingGameFor duration [(player, program)]
+      (trace, _) = run $ State.runState [] $ runTradingGameWithReveals allInstruments simulationStart duration [] [(player, program)]
       placedAt = Data.Time.Clock.addUTCTime spacing simulationStart
       closedAt = Data.Time.Clock.addUTCTime duration simulationStart
       initial = newEngine simulationStart duration [player]
@@ -98,7 +101,7 @@ prop_staleSnapshot (Positive duration) = forAll genRoster $ \roster -> forAll ge
         after <- awaitExchangeChange before
         State.put (Just after)
       (observed, _) = run $ State.runState Nothing $
-        runTradingGameFor (fromInteger duration) [(head roster, program)]
+        runTradingGameWithReveals allInstruments simulationStart (fromInteger duration) [] [(head roster, program)]
       initial = newEngine simulationStart (fromInteger duration) [head roster]
       updated = fst (handleRequest simulationStart (playerID (head roster)) (SubmitOrder order) initial)
   in observed === Just (exchangeSnapshot simulationStart updated)

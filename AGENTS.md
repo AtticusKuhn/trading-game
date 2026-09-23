@@ -126,3 +126,20 @@ All players start off with `0` cash, but
 there are no limits on the amount of buying or
 selling. A player may have negative cash and 
 still trade.
+
+
+
+# Market Events & Number Reveals
+At certain points in the game, 
+a private number of a player is publically
+revealed, representing a market-event.
+
+The number to be revealed is chosen randomly
+with replacement, meaning that the same 
+number can be chosen multiple times.
+
+Each player's number could be chosen to be revealed
+with equal probability, even a bot player's number.
+
+Sampling must choose uniformly from the full, fixed player roster, including bots and humans. if several players have the same number, that value should be correspondingly more likely.
+

@@ -154,7 +154,7 @@
         let project = projectFor system;
         in {
           default = project.pkgs.mkShell {
-            packages = [ project.ghc ];
+            packages = [ project.ghc project.pkgs.cloc ];
           };
         });
 

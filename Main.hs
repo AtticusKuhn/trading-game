@@ -19,6 +19,7 @@ import ConcurrentTests (concurrentProperties)
 import SimulationTests (simulationProperties)
 import WebTests (webProperties)
 import ManageGamesTests (manageGamesProperties)
+import RevealTests (revealProperties)
 
 -- Eff programs have no Show instance. Print the secrets and resulting
 -- settlements on failure; QuickCheck's replay seed reproduces the programs.
@@ -72,6 +73,6 @@ main = do
     ([ prop_settlementsSumToZero
     , prop_singlePlayerSettlementIsZero
     , prop_samePriceLeavesOnlyOneSide
-    ] ++ engineProperties ++ liveProperties ++ interactionProperties ++ concurrentProperties ++ simulationProperties ++ sessionProperties ++ webProperties ++ manageGamesProperties)
+    ] ++ engineProperties ++ liveProperties ++ interactionProperties ++ concurrentProperties ++ simulationProperties ++ sessionProperties ++ webProperties ++ manageGamesProperties ++ revealProperties)
   discoverLaws
   unless (all isSuccess results) exitFailure

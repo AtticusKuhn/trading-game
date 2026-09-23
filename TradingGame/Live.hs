@@ -13,10 +13,12 @@ import Control.Monad (when)
 import Data.Set (Set)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
+import System.Random (newStdGen)
 import TradingGame.Concurrent
 import TradingGame.Core
 import TradingGame.Player
 import TradingGame.Session
+import TradingGame.Reveals
 
 -- The alarm action must become ready once clockNow >= its target. Both parts
 -- must use the same nondecreasing clock. Tests can implement both with one TVar.
@@ -53,13 +55,14 @@ data LiveEvent where
 data LiveConfig = LiveConfig
   { liveDuration :: NominalDiffTime
   , liveInstruments :: Set Instrument
+  , liveRevealPlan :: Maybe [(UTCTime, PlayerId)]
   -- Runs under the engine lock. Keep it short; exceptions abort the run.
   -- Traces are private to the host, including private-number replies.
   , onLiveEvent :: LiveEvent -> IO ()
   }
 
 defaultLiveConfig :: LiveConfig
-defaultLiveConfig = LiveConfig 3600 allInstruments (const (pure ()))
+defaultLiveConfig = LiveConfig 3600 allInstruments Nothing (const (pure ()))
 
 data LiveRuntime = LiveRuntime
   { runtimeClock :: LiveClock
@@ -99,14 +102,21 @@ requestLive runtime pid request = do
     runtimeTrace runtime (RequestHandled now pid request decision)
     pure (updated, decision)
 
--- Close even when every player has finished or is waiting. Requests also close
--- the engine at the deadline, so active players cannot keep trading past it.
+-- Publish reveals and close even when every player has finished or is waiting.
+-- Requests also advance the engine, so scheduler latency cannot hide due events
+-- from an active caller or allow trading past the deadline.
 runExchange :: LiveRuntime -> IO Engine
 runExchange runtime = do
-  initial <- readMVar (runtimeEngine runtime)
-  clockAlarm (runtimeClock runtime) (closesAt (engineInfo initial)) >>= atomically
-  modifyLiveEngine runtime $ \now engine ->
-    let final = advanceTo now engine in pure (final, final)
+  current <- modifyLiveEngine runtime $ \now engine ->
+    let updated = advanceTo now engine in pure (updated, updated)
+  case enginePhase current of
+    Resolved _ -> pure current
+    Trading -> do
+      let target = case pendingReveals current of
+            (time, _):_ -> time
+            [] -> closesAt (engineInfo current)
+      clockAlarm (runtimeClock runtime) target >>= atomically
+      runExchange runtime
 
 -- Bind the entire inner computation to the identity selected by the outer
 -- session. Rejected sessions do not execute any part of the computation.
@@ -136,6 +146,9 @@ handleLiveRequest runtime pid request = do
     Reply value -> pure value
     ResumeAt target -> clockAlarm (runtimeClock runtime) target >>= atomically
     WhenResolved -> settlementFor pid <$> runExchange runtime
+    WhenRevealed target value -> do
+      clockAlarm (runtimeClock runtime) target >>= atomically
+      modifyLiveEngine runtime $ \now engine -> pure (advanceTo now engine, Just value)
     WhenExchangeChanges previous -> do
       atomically (readTVar (runtimeSnapshot runtime) >>= check . exchangeChanged previous)
       handleLiveRequest runtime pid GetExchangeState
@@ -166,8 +179,12 @@ runLiveWith clock config programs = engineSettlements <$> runLiveEngineWith cloc
 runLiveEngineWith :: (IOE :< effs, Concurrent :< effs) => LiveClock -> LiveConfig -> [PlayerProgram effs] -> Eff effs Engine
 runLiveEngineWith clock config programs = do
   start <- liftIO (clockNow clock)
-  let initial = newEngineWithInstruments (liveInstruments config) start (liveDuration config)
-        (map fst programs)
+  seed <- liftIO newStdGen
+  let roster = map fst programs
+      plan = maybe (sampleRevealTargets seed roster
+        (defaultRevealTimes start (addUTCTime (liveDuration config) start) (length roster))) id
+        (liveRevealPlan config)
+      initial = newEngineWithReveals (liveInstruments config) start (liveDuration config) roster plan
   runtime <- liftIO (newLiveRuntime clock (onLiveEvent config) initial)
   let worker = runLivePlayer runtime
   withWorkers (map worker programs) (liftIO (runExchange runtime))

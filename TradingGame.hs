@@ -8,6 +8,7 @@ module TradingGame
   , module TradingGame.Live
   , module TradingGame.ManageGames
   , module TradingGame.Session
+  , module TradingGame.Reveals
   ) where
 
 import TradingGame.Concurrent
@@ -18,3 +19,4 @@ import TradingGame.Player
 import TradingGame.Simulation
 import TradingGame.ManageGames
 import TradingGame.Session
+import TradingGame.Reveals

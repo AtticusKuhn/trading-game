@@ -13,6 +13,7 @@ import Control.Monad (void)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Ratio ((%))
+import Data.List (nub)
 import Test.QuickCheck
 import LiveTests (manualClock, liveProperty)
 import TestSupport (genOrder, genRoster)
@@ -73,7 +74,7 @@ prop_automaticSettlement (Positive duration) (Positive later) = forAll genRoster
         runTradingGameFor (fromInteger duration) [(player, void interactivePlayer)]
   in conjoin
     [ [value | PlayerSettlement value <- output] === settlements
-    , [gamePhase value | ExchangeSnapshot value <- output] === [Trading, Resolved (Map.fromSet (\asset -> resolve asset [privateNumber player]) allInstruments)]
+    , nub [gamePhase value | ExchangeSnapshot value <- output] === [Trading, Resolved (Map.fromSet (\asset -> resolve asset [privateNumber player]) allInstruments)]
     ]
 
 -- The same player and input produce the same command replies under pure

@@ -15,11 +15,11 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Ratio ((%), numerator, denominator)
-import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
+import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, diffUTCTime)
 
 newtype PlayerId = PlayerId Integer deriving (Eq, Ord, Show)
 
--- Private during trading; revealed in settlement, never in exchange snapshots.
+-- Identities stay private during trading; scheduled events reveal only numbers.
 data Player = Player
   { playerID :: PlayerId
   , displayName :: String
@@ -103,9 +103,10 @@ data GameInfo = GameInfo
   , opensAt :: UTCTime
   , closesAt :: UTCTime
   , enabledInstruments :: Set Instrument
+  , revealTimes :: [UTCTime]
   } deriving (Eq, Show)
 
--- The resolutions and individual numbers are revealed only once the game resolves.
+-- Resolutions and the full player-to-number mapping appear at settlement.
 -- Outstanding orders expire at the deadline.
 data GamePhase = Trading | Resolved Resolutions deriving (Eq, Show)
 
@@ -132,6 +133,7 @@ data ExchangeState = ExchangeState
   , gamePhase :: GamePhase
   , orderBook :: Map Instrument [RestingOrder]
   , tradeHistory :: [Trade]
+  , revealedNumbers :: [Integer]
   } deriving (Eq, Show)
 
 data OrderError = GameClosed | InvalidQuantity | InstrumentDisabled deriving (Eq, Show)
@@ -161,6 +163,7 @@ data TradingGame :: Effect where
   AwaitExchangeChange :: ExchangeState -> TradingGame m ExchangeState
   SubmitOrder :: LimitOrder -> TradingGame m OrderResult
   AwaitSettlement :: TradingGame m Settlement
+  AwaitUntilNextReveal :: TradingGame m (Maybe Integer)
   Wait :: NominalDiffTime -> TradingGame m ()
   WaitUntil :: UTCTime -> TradingGame m ()
 
@@ -182,6 +185,11 @@ submitOrder = send . SubmitOrder
 -- Wait until the deadline, or return immediately if already resolved.
 awaitSettlement :: TradingGame :< effs => Eff effs Settlement
 awaitSettlement = send AwaitSettlement
+
+-- Wait for the first strictly future reveal. Simultaneous events are all
+-- published together; this returns the first one's number, not a backlog.
+awaitUntilNextReveal :: TradingGame :< effs => Eff effs (Maybe Integer)
+awaitUntilNextReveal = send AwaitUntilNextReveal
 
 -- Sleep in game time. Nonpositive durations and past targets do not advance it.
 -- Resting orders can still fill while the player sleeps.
@@ -209,6 +217,8 @@ data Engine = Engine
   , players :: [Player]
   , enginePhase :: GamePhase
   , engineBook :: !Exchange
+  , pendingReveals :: [(UTCTime, Integer)]
+  , engineRevealedNumbers :: [Integer]
   } deriving (Eq, Show)
 
 -- The engine describes scheduling without performing it. A settlement is only
@@ -218,30 +228,55 @@ data Decision a where
   ResumeAt :: UTCTime -> Decision ()
   WhenResolved :: Decision Settlement
   WhenExchangeChanges :: ExchangeState -> Decision ExchangeState
+  WhenRevealed :: UTCTime -> Integer -> Decision (Maybe Integer)
 
 deriving instance Eq a => Eq (Decision a)
 deriving instance Show a => Show (Decision a)
 
 -- Names are exact, case-sensitive identities. Reject ambiguous rosters up front.
--- Nonpositive durations produce a game that is closed at its start.
+-- Nonpositive durations produce a game that is closed at its start. These
+-- low-level convenience constructors use an empty reveal plan; runners and
+-- game creation supply sampled plans through newEngineWithReveals.
 newEngine :: UTCTime -> NominalDiffTime -> [Player] -> Engine
 newEngine = newEngineWithInstruments allInstruments
 
 newEngineWithInstruments :: Set Instrument -> UTCTime -> NominalDiffTime -> [Player] -> Engine
-newEngineWithInstruments enabled start duration roster
+newEngineWithInstruments enabled start duration roster =
+  newEngineWithReveals enabled start duration roster []
+
+-- Pure constructors never draw randomness. The host supplies a fixed plan of
+-- roster identities, including repeated identities and simultaneous events.
+newEngineWithReveals :: Set Instrument -> UTCTime -> NominalDiffTime -> [Player] -> [(UTCTime, PlayerId)] -> Engine
+newEngineWithReveals enabled start duration roster plan
   | null roster = error "newEngine: empty player roster"
   | length (nub (map playerID roster)) /= length roster =
       error "newEngine: duplicate player IDs"
   | length (nub (map displayName roster)) /= length roster =
       error "newEngine: duplicate display names"
   | any (all isSpace . displayName) roster = error "newEngine: empty display name"
+  | any (\(time, pid) -> time < start || time >= end || pid `notElem` map playerID roster) plan =
+      error "newEngine: invalid reveal time or player ID"
   | otherwise = Engine
-      { engineInfo = GameInfo (length roster) start (addUTCTime (max 0 duration) start) enabled
+      { engineInfo = GameInfo (length roster) start end enabled (map fst ordered)
       , players = roster
       , enginePhase = Trading
       , engineBook = Exchange 1 (Map.fromSet (const []) enabled) []
           (Map.fromList [(playerID player, Account 0 Map.empty) | player <- roster])
+      , pendingReveals = [(time, numberFor pid) | (time, pid) <- ordered]
+      , engineRevealedNumbers = []
       }
+  where
+    end = addUTCTime (max 0 duration) start
+    ordered = sortOn fst plan
+    numberFor pid = case find ((== pid) . playerID) roster of
+      Just player -> privateNumber player
+      Nothing -> error "newEngine: unknown reveal target"
+
+defaultRevealTimes :: UTCTime -> UTCTime -> Int -> [UTCTime]
+defaultRevealTimes start end count
+  | end <= start = []
+  | otherwise = [addUTCTime (fromRational (toRational (diffUTCTime end start)
+      * (toInteger i % (toInteger count + 1)))) start | i <- [1..count]]
 
 engineResolutions :: Engine -> Resolutions
 engineResolutions engine = Map.fromSet
@@ -254,12 +289,17 @@ engineSettlements engine =
   | player <- players engine]
 
 advanceTo :: UTCTime -> Engine -> Engine
-advanceTo now engine = case enginePhase engine of
+advanceTo now initial = case enginePhase engine of
   Trading | now >= closesAt (engineInfo engine) -> engine
     { enginePhase = Resolved (engineResolutions engine)
     , engineBook = (engineBook engine) { books = Map.map (const []) (books (engineBook engine)) }
     }
   _ -> engine
+  where
+    (due, future) = span ((<= now) . fst) (pendingReveals initial)
+    engine | null due = initial
+           | otherwise = initial { pendingReveals = future
+                                 , engineRevealedNumbers = engineRevealedNumbers initial ++ map snd due }
 
 -- Caller identity is supplied by the host, never by the player effect.
 -- Deadline checking precedes every request, including quantity validation.
@@ -275,6 +315,9 @@ handleRequest now pid request initial =
       Just player -> privateNumber player
       Nothing -> error "handleRequest: unknown player ID"
     GetExchangeState -> answer (exchangeSnapshot now engine)
+    AwaitUntilNextReveal -> case pendingReveals engine of
+      [] -> answer Nothing
+      (time, value):_ -> (engine, WhenRevealed time value)
     AwaitExchangeChange previous
       | exchangeChanged previous (exchangeSnapshot now engine) -> answer (exchangeSnapshot now engine)
       | otherwise -> (engine, WhenExchangeChanges previous)
@@ -299,6 +342,7 @@ exchangeChanged :: ExchangeState -> ExchangeState -> Bool
 exchangeChanged before after =
   gamePhase before /= gamePhase after || orderBook before /= orderBook after
     || tradeHistory before /= tradeHistory after
+    || revealedNumbers before /= revealedNumbers after
 
 exchangeSnapshot :: UTCTime -> Engine -> ExchangeState
 exchangeSnapshot now engine = ExchangeState
@@ -307,6 +351,7 @@ exchangeSnapshot now engine = ExchangeState
   , gamePhase = enginePhase engine
   , orderBook = Map.map (map snd) (books (engineBook engine))
   , tradeHistory = reverse (executedTrades (engineBook engine))
+  , revealedNumbers = engineRevealedNumbers engine
   }
 
 -- Host-only helper; interpreters call this after resolution.

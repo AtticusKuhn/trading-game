@@ -13,7 +13,7 @@ import Data.ByteString.Builder (toLazyByteString)
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.List (sortOn)
+import Data.List (sortOn, sort)
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -41,7 +41,7 @@ genConfig = do
   Positive duration <- arbitrary
   let start = addUTCTime (fromInteger offset) simulationStart
   pure (NewGameConfig start (addUTCTime (fromInteger duration) start)
-    (zipWith (RosterEntry . displayName) roster types) enabled)
+    (zipWith (RosterEntry . displayName) roster types) enabled Nothing)
 
 shrinkConfig :: NewGameConfig -> [NewGameConfig]
 shrinkConfig config =
@@ -153,12 +153,16 @@ prop_invalidConfig = forAllShrink genConfig shrinkConfig $ \config ->
 
 configFields :: NewGameConfig -> [(B.ByteString, B.ByteString)]
 configFields config = [("start", stamp (gameStart config)), ("end", stamp (gameEnd config))]
-  ++ [("instruments-present", "yes")]
-  ++ [("instrument", B.pack (show asset)) | asset <- Set.toAscList (gameInstruments config)]
-  ++ concat [[("player-name", T.encodeUtf8 (T.pack (rosterName entry))), ("player-type", kind (rosterType entry))]
-            | entry <- gameRoster config]
+  ++ case gameRevealTimes config of
+       Nothing -> rosterFields
+       Just times -> [("reveal-mode", "custom"), ("reveal-times", B.unwords (map stamp times))] ++ rosterFields
   where
-    stamp = B.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S"
+    rosterFields =
+      [("instruments-present", "yes")]
+      ++ [("instrument", B.pack (show asset)) | asset <- Set.toAscList (gameInstruments config)]
+      ++ concat [[("player-name", T.encodeUtf8 (T.pack (rosterName entry))), ("player-type", kind (rosterType entry))]
+                | entry <- gameRoster config]
+    stamp = B.pack . formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%Q"
     kind HumanPlayer = "human"
     kind RandomTradingBot = "random"
     kind MarketMakingBot = "maker"
@@ -239,7 +243,40 @@ prop_startStream = forAllShrink genConfig shrinkConfig $ \config ->
 
 manageGamesProperties :: [Property]
 manageGamesProperties = [prop_directory, prop_window, prop_automaticLifecycle, prop_isolation,
-  prop_invalidConfig, prop_creationForm, prop_defaultInstruments, prop_httpIsolation, prop_playerTypes, prop_futureHTTP, prop_startStream]
+  prop_invalidConfig, prop_creationForm, prop_defaultInstruments, prop_httpIsolation, prop_playerTypes, prop_futureHTTP, prop_startStream,
+  prop_revealConfig, prop_invalidReveals]
+
+-- Custom schedules survive form parsing and creation unchanged in cardinality,
+-- including no reveals, repeated times, and numbers belonging to bots.
+prop_revealConfig :: Property
+prop_revealConfig = forAll genConfig $ \base ->
+  forAll (listOf (chooseInteger (0, ceiling (diffUTCTime (gameEnd base) (gameStart base)) - 1))) $ \offsets ->
+    liveProperty "custom reveal configuration" $ do
+      let times = map (\offset -> addUTCTime (fromInteger offset) (gameStart base)) offsets
+          config = base { gameRevealTimes = Just times }
+      (clock, advance) <- manualClock (gameStart config)
+      withGameManager clock $ \manager -> do
+        Right gid <- manage manager (createNewGame config)
+        Just runtime <- gameRuntime manager gid
+        advance (gameEnd config)
+        final <- runExchange runtime
+        pure $ conjoin
+          [ parseNewGameForm (configFields config) === Right config
+          , revealTimes (engineInfo final) === sort times
+          , length (engineRevealedNumbers final) === length times
+          , property (all (`elem` map privateNumber (players final)) (engineRevealedNumbers final))
+          ]
+
+prop_invalidReveals :: Property
+prop_invalidReveals = forAll genConfig $ \config ->
+  forAll (arbitrary :: Gen (Positive Integer)) $ \(Positive gap) ->
+  forAll (elements [addUTCTime (negate (fromInteger gap)) (gameStart config),
+                    addUTCTime (fromInteger (gap - 1)) (gameEnd config)]) $ \time ->
+    liveProperty "invalid reveal window" $ do
+      (clock, _) <- manualClock (gameStart config)
+      withGameManager clock $ \manager -> do
+        result <- manage manager (createNewGame config { gameRevealTimes = Just [time] })
+        pure (result === Left InvalidRevealTimes)
 
 -- An omitted selection uses the default; an explicit empty selection stays empty.
 prop_defaultInstruments :: Property

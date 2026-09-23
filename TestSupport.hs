@@ -5,6 +5,7 @@ module TestSupport where
 import Control.Effect (Eff)
 import Control.Monad (void)
 import Data.Ratio ((%))
+import Data.Time.Clock (addUTCTime)
 import Test.QuickCheck
 import TradingGame
 
@@ -37,6 +38,16 @@ genEngine = do
   let initial = newEngine simulationStart 60 roster
   pure (foldl (\engine (pid, order) ->
     fst (handleRequest simulationStart pid (SubmitOrder order) engine)) initial orders)
+
+genRevealEngine :: Gen Engine
+genRevealEngine = do
+  roster <- genRoster
+  offset <- arbitrary
+  Positive duration <- arbitrary
+  let start = addUTCTime (fromInteger offset) simulationStart
+  plan <- listOf ((,) <$> ((\n -> addUTCTime (fromInteger n) start) <$> chooseInteger (0, duration - 1))
+    <*> elements (map playerID roster))
+  pure (newEngineWithReveals allInstruments start (fromInteger duration) roster plan)
 
 genRoster :: Gen [Player]
 genRoster = do

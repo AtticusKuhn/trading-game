@@ -324,6 +324,17 @@ exchangeView snapshot settlement = do
         cell (displayName (settledPlayer entry))
         cell (show (privateNumber (settledPlayer entry)))
         cell (number (playerPayoff entry))
+  panel $ do
+    H.h2 ! A.class_ "text-xl font-semibold" $ "Market reveals"
+    H.p "Each event independently selects a player, including bots. Numbers can repeat."
+    if null (revealTimes (gameInfo snapshot)) then H.p "No reveals scheduled."
+    else H.ol ! A.class_ "space-y-2 font-mono" $
+      forM_ (zip (revealTimes (gameInfo snapshot)) (map Just (revealedNumbers snapshot) ++ repeat Nothing)) $ \(time, value) ->
+        H.li $ do
+          toHtml (show time ++ " · ")
+          case value of
+            Nothing -> H.span ! A.class_ "text-slate-500" $ "Upcoming"
+            Just revealed -> H.strong ! A.class_ "text-indigo-700" $ toHtml (show revealed)
   forM_ (Map.toAscList (orderBook snapshot)) $ \(asset, book) ->
     H.section ! attr "data-instrument" (H.toValue (show asset)) ! A.class_ "space-y-4" $ do
       H.h2 ! A.class_ "text-xl font-semibold" $ toHtml (show asset)
@@ -500,6 +511,8 @@ availabilityView summary = do
   panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ toHtml (statusLabel (summaryStatus summary))
     H.p $ toHtml ("Starts: " ++ show (gameStart config) ++ " · Ends: " ++ show (gameEnd config))
+    H.p "Reveal times (UTC)"
+    H.ul $ forM_ (configuredRevealTimes config) (H.li . toHtml . show)
     H.ul $ forM_ (gameRoster config) $ \entry ->
       H.li $ toHtml (rosterName entry ++ " · " ++ playerTypeLabel (rosterType entry))
   case summaryStatus summary of
@@ -520,6 +533,7 @@ creationError InvalidTimeWindow = "End time must be later than start time."
 creationError EmptyRoster = "Add at least one player."
 creationError BlankPlayerName = "Every player needs a name."
 creationError DuplicatePlayerNames = "Player names must be unique within this game."
+creationError InvalidRevealTimes = "Reveal times must be at or after the start and before the end."
 creationError ManagerClosed = "The server is shutting down."
 
 -- UTC is explicit: datetime-local values have no browser timezone attached.
@@ -527,6 +541,12 @@ parseNewGameForm :: [(BS.ByteString, BS.ByteString)] -> Either String NewGameCon
 parseNewGameForm fields = do
   start <- timestamp "start"
   end <- timestamp "end"
+  schedule <- case lookup "reveal-mode" fields of
+    Nothing -> pure Nothing
+    Just "default" -> pure Nothing
+    Just "custom" -> Just <$> traverse parseReveal
+      (words (B.unpack (maybe "" id (lookup "reveal-times" fields))))
+    _ -> Left "Choose a supported reveal schedule."
   selected <- if lookup "instruments-present" fields == Nothing && not (any ((== "instrument") . fst) fields)
     then pure allInstruments
     else Set.fromList <$> traverse parseInstrument [value | (key, value) <- fields, key == "instrument"]
@@ -534,7 +554,7 @@ parseNewGameForm fields = do
   types <- traverse parseType [value | (key, value) <- fields, key == "player-type"]
   if length names /= length types then Left "Every roster row needs a name and player type."
   else pure (NewGameConfig start end [RosterEntry (T.unpack name) kind
-        | (name, kind) <- zip names types, not (T.null name)] selected)
+        | (name, kind) <- zip names types, not (T.null name)] selected schedule)
   where
     parseInstrument value = case readMaybe (B.unpack value) of
       Just asset -> Right asset
@@ -543,7 +563,8 @@ parseNewGameForm fields = do
     timestamp key = case lookup key fields >>= parseTimestamp . B.unpack of
       Nothing -> Left "Enter start and end times in UTC."
       Just value -> Right value
-    parseTimestamp value = case parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%S" value of
+    parseReveal value = maybe (Left "Enter each reveal as a UTC timestamp, e.g. 2026-09-22T12:30:00.") Right (parseTimestamp value)
+    parseTimestamp value = case parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M:%S%Q" value of
       Just time -> Just time
       Nothing -> parseTimeM True defaultTimeLocale "%Y-%m-%dT%H:%M" value
     parseType "human" = Right HumanPlayer
@@ -563,6 +584,20 @@ creationView duration fields problem = panel $ do
       H.input ! A.type_ "datetime-local" ! A.name (H.toValue (B.unpack key)) ! A.required "" ! A.step "1"
         ! A.value (H.toValue (B.unpack (maybe "" id (lookup key fields)))) ! A.class_ inputClass
     H.p ! A.class_ "text-sm text-slate-600" $ toHtml ("Suggested duration: " ++ show duration ++ ". All times are UTC.")
+    H.fieldset ! A.class_ "space-y-2" $ do
+      H.legend ! A.class_ "font-semibold" $ "Market reveals"
+      H.label $ do
+        "Schedule"
+        H.select ! A.name "reveal-mode" ! A.class_ inputClass $
+          forM_ [("default", "Default: one reveal per player, evenly spaced"), ("custom", "Custom times (leave empty for no reveals)")] $ \(value, label) ->
+            (if lookup "reveal-mode" fields == Just value then (! A.selected "") else id) $
+              H.option ! A.value (H.toValue (B.unpack value)) $ toHtml (label :: String)
+      H.label ! A.class_ "block" $ do
+        "Custom reveal times (UTC), one per line"
+        H.textarea ! A.name "reveal-times" ! A.rows "4" ! A.class_ inputClass
+          ! A.placeholder "2026-09-22T12:30:00" $
+            toHtml (B.unpack (maybe "" id (lookup "reveal-times" fields)))
+      H.p ! A.class_ "text-sm text-slate-600" $ "Each line adds one reveal. Times must be within the game, before the end. Repeated times are allowed. The default uses start + (end − start) × i / (N + 1), for i = 1 … N, including bots."
     H.fieldset ! A.class_ "space-y-2" $ do
       H.legend ! A.class_ "font-semibold" $ "Enabled instruments"
       H.input ! A.type_ "hidden" ! A.name "instruments-present" ! A.value "yes"

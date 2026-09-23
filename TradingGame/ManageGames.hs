@@ -6,7 +6,7 @@
 -- Scheduling belongs to the host. No LiveRuntime exists before a game's start.
 module TradingGame.ManageGames
   ( ManageGames(..), GameId(..), PlayerType(..), RosterEntry(..)
-  , NewGameConfig(..), defaultNewGameConfig, CreateGameError(..), GameStatus(..), GameSummary(..)
+  , NewGameConfig(..), defaultNewGameConfig, configuredRevealTimes, CreateGameError(..), GameStatus(..), GameSummary(..)
   , GameManager, withGameManager, runManageGames
   , createNewGame, lookupGame, listAllGames
   , gameRuntime, gameRevision
@@ -19,7 +19,7 @@ import Control.Effect (Eff, Effect, IOE, (:<), interpret, liftIO, runIO, send)
 import Control.Exception (SomeException, bracket, displayException, try)
 import Control.Monad (void)
 import Data.Char (isSpace)
-import Data.List (nub)
+import Data.List (nub, sort)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import Data.Time.Clock (UTCTime, diffUTCTime)
@@ -28,6 +28,7 @@ import TradingGame.Bots
 import TradingGame.Concurrent
 import TradingGame.Core
 import TradingGame.Live
+import TradingGame.Reveals
 
 newtype GameId = GameId Integer deriving (Eq, Ord, Show)
 data PlayerType = HumanPlayer | RandomTradingBot | MarketMakingBot deriving (Eq, Show)
@@ -40,14 +41,21 @@ data NewGameConfig = NewGameConfig
   , gameEnd :: UTCTime
   , gameRoster :: [RosterEntry]
   , gameInstruments :: Set Instrument
+  , gameRevealTimes :: Maybe [UTCTime]
   } deriving (Eq, Show)
 
 -- Hosts can override the instrument set before submitting the configuration.
 defaultNewGameConfig :: UTCTime -> UTCTime -> [RosterEntry] -> NewGameConfig
-defaultNewGameConfig start end roster = NewGameConfig start end roster allInstruments
+defaultNewGameConfig start end roster = NewGameConfig start end roster allInstruments Nothing
+
+-- Nothing selects the evenly spaced default; Just [] disables reveals.
+configuredRevealTimes :: NewGameConfig -> [UTCTime]
+configuredRevealTimes config = sort $ maybe
+  (defaultRevealTimes (gameStart config) (gameEnd config) (length (gameRoster config))) id
+  (gameRevealTimes config)
 
 data CreateGameError = InvalidTimeWindow | EmptyRoster | BlankPlayerName
-  | DuplicatePlayerNames | ManagerClosed deriving (Eq, Show)
+  | DuplicatePlayerNames | InvalidRevealTimes | ManagerClosed deriving (Eq, Show)
 
 -- These are directory statuses, not phases of the exchange model.
 data GameStatus = Upcoming | Running | Completed | Failed deriving (Eq, Show)
@@ -113,6 +121,8 @@ validate config
   | null names = Left EmptyRoster
   | any (all isSpace) names = Left BlankPlayerName
   | length (nub names) /= length names = Left DuplicatePlayerNames
+  | any (\time -> time < gameStart config || time >= gameEnd config) (configuredRevealTimes config) =
+      Left InvalidRevealTimes
   | otherwise = Right ()
   where names = map rosterName (gameRoster config)
 
@@ -124,11 +134,14 @@ createGameIO manager config = case validate config of
       roster <- sequence [Player (PlayerId n) (rosterName entry) <$> randomRIO (1, 9)
         | (n, entry) <- zip [1..] (gameRoster config)]
       seeds <- mapM (const newStdGen) roster
+      revealSeed <- newStdGen
       runtime <- newMVar Nothing
       failure <- newTVarIO Nothing
       let gid = GameId (registryNext registry)
           game = ManagedGame config
-            (newEngineWithInstruments (gameInstruments config) (gameStart config) (diffUTCTime (gameEnd config) (gameStart config)) roster)
+            (newEngineWithReveals (gameInstruments config) (gameStart config)
+              (diffUTCTime (gameEnd config) (gameStart config)) roster
+              (sampleRevealTargets revealSeed roster (configuredRevealTimes config)))
             seeds runtime failure
       -- Immediate games are available before creation returns, even if already expired.
       void (activate manager game)

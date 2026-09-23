@@ -68,6 +68,7 @@ prop_closure = forAll genEngine $ \engine ->
           , gamePhase = Resolved (engineResolutions engine)
           , orderBook = Map.map (const []) (books (engineBook engine))
           , tradeHistory = reverse (executedTrades (engineBook engine))
+          , revealedNumbers = []
           }
       ]
 
@@ -116,7 +117,7 @@ prop_waits = forAll genEngine $ \engine ->
 newtype SampleEngine = SampleEngine Engine deriving Show
 
 instance Arbitrary SampleEngine where
-  arbitrary = SampleEngine <$> genEngine
+  arbitrary = SampleEngine <$> oneof [genEngine, genRevealEngine]
 
 instance QS.Observe () String SampleEngine where
   observe () = show

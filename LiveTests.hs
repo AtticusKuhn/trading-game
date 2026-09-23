@@ -101,6 +101,7 @@ sameDecision request expected actual = case request of
   Wait _ -> expected == actual
   WaitUntil _ -> expected == actual
   AwaitSettlement -> expected == actual
+  AwaitUntilNextReveal -> expected == actual
 
 replay :: Engine -> [LiveEvent] -> Either String Engine
 replay = foldM step
@@ -204,7 +205,7 @@ prop_concurrentPlayers scenario generated = liveProperty "concurrent programs, w
                  PlayerResult (testPlayer buyerId buyerSecret) payoff]
       programs = [(testPlayer sellerId sellerSecret, seller), (testPlayer buyerId buyerSecret, buyer)]
       initial = newEngine start duration [testPlayer sellerId sellerSecret, testPlayer buyerId buyerSecret]
-      config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
+      config = defaultLiveConfig { liveDuration = duration, liveRevealPlan = Just [], onLiveEvent = record events }
   Async.withAsync (runIO (runConcurrent (runLiveEngineWith clock config programs))) $ \game -> do
     awaitTrace events (\trace -> hasWait buyerId trace && hasWait sellerId trace)
     advance (addUTCTime sellerWake start)

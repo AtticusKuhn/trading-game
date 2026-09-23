@@ -7,6 +7,8 @@ import qualified Control.Effect.State.Strict as State
 import Control.Monad (void)
 import System.Environment (getArgs)
 import System.Exit (die)
+import System.Random (mkStdGen, newStdGen)
+import Data.Time.Clock (addUTCTime)
 import Text.Read (readMaybe)
 import TradingGame
 import TradingGame.Terminal
@@ -26,8 +28,10 @@ main = do
       Just n | n >= 0 -> pure (mode, fromInteger n)
       _ -> die usage
     _ -> die usage
+  seed <- if mode == "sim" then pure (mkStdGen 0) else newStdGen
   let initial start = foldl (\engine order -> fst (handleRequest start (PlayerId 2) (SubmitOrder order) engine))
-        (newEngine start duration roster)
+        (newEngineWithReveals allInstruments start duration roster
+          (sampleRevealTargets seed roster (defaultRevealTimes start (addUTCTime duration start) (length roster))))
         [LimitOrder Buy (Price 9) Sum 10, LimitOrder Sell (Price 11) Sum 10]
   putStrLn $ "Trading game terminal (" ++ mode ++ ", " ++ show duration ++ ")."
   putStrLn "Players: alice, market-maker. Start with: join alice"
