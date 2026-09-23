@@ -19,7 +19,7 @@ import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, diffUTCTime)
 
 newtype PlayerId = PlayerId Integer deriving (Eq, Ord, Show)
 
--- Identities stay private during trading; scheduled events reveal only numbers.
+-- Names and portfolios are public; private numbers stay secret until revealed.
 data Player = Player
   { playerID :: PlayerId
   , displayName :: String
@@ -41,7 +41,24 @@ type Resolutions = Map Instrument Rational
 data Account = Account
   { cash :: Rational
   , positions :: Positions
+  -- Signed cumulative spending per instrument, retained even when holdings reach zero.
+  , netSpent :: Map Instrument Rational
   } deriving (Eq, Show)
+
+-- Filled holdings only. Missing positions mean zero; shorts and cash can be negative.
+-- Keep this separate from Player so snapshots cannot disclose private numbers.
+data PublicPortfolio = PublicPortfolio
+  { portfolioName :: String
+  , portfolioCash :: Rational
+  , portfolioPositions :: Positions
+  -- Net spending divided by current units; absent for zero holdings.
+  , portfolioEffectivePrices :: Map Instrument Rational
+  } deriving (Eq, Show)
+
+effectivePrices :: Account -> Map Instrument Rational
+effectivePrices account = Map.mapWithKey
+  (\asset units -> Map.findWithDefault 0 asset (netSpent account) / fromInteger units)
+  (Map.filter (/= 0) (positions account))
 
 -- The host guarantees a nonempty roster. Median averages the middle pair.
 -- Population standard deviation rounds to the nearest millionth (ties up).
@@ -134,6 +151,7 @@ data ExchangeState = ExchangeState
   , orderBook :: Map Instrument [RestingOrder]
   , tradeHistory :: [Trade]
   , revealedNumbers :: [Integer]
+  , portfolios :: Map PlayerId PublicPortfolio
   } deriving (Eq, Show)
 
 data OrderError = GameClosed | InvalidQuantity | InstrumentDisabled deriving (Eq, Show)
@@ -261,7 +279,7 @@ newEngineWithReveals enabled start duration roster plan
       , players = roster
       , enginePhase = Trading
       , engineBook = Exchange 1 (Map.fromSet (const []) enabled) []
-          (Map.fromList [(playerID player, Account 0 Map.empty) | player <- roster])
+          (Map.fromList [(playerID player, Account 0 Map.empty Map.empty) | player <- roster])
       , pendingReveals = [(time, numberFor pid) | (time, pid) <- ordered]
       , engineRevealedNumbers = []
       }
@@ -343,6 +361,7 @@ exchangeChanged before after =
   gamePhase before /= gamePhase after || orderBook before /= orderBook after
     || tradeHistory before /= tradeHistory after
     || revealedNumbers before /= revealedNumbers after
+    || portfolios before /= portfolios after
 
 exchangeSnapshot :: UTCTime -> Engine -> ExchangeState
 exchangeSnapshot now engine = ExchangeState
@@ -352,6 +371,10 @@ exchangeSnapshot now engine = ExchangeState
   , orderBook = Map.map (map snd) (books (engineBook engine))
   , tradeHistory = reverse (executedTrades (engineBook engine))
   , revealedNumbers = engineRevealedNumbers engine
+  , portfolios = Map.fromList
+      [(playerID player, PublicPortfolio (displayName player) (cash account) (positions account) (effectivePrices account))
+      | player <- players engine
+      , let account = accounts (engineBook engine) Map.! playerID player]
   }
 
 -- Host-only helper; interpreters call this after resolution.
@@ -366,7 +389,7 @@ settlementFor pid engine = Settlement
       Resolved resolved -> resolved
       Trading -> error "settlementFor: game has not resolved"
     payoff who =
-      let account = Map.findWithDefault (Account 0 Map.empty) who (accounts (engineBook engine))
+      let account = Map.findWithDefault (Account 0 Map.empty Map.empty) who (accounts (engineBook engine))
       in cash account + sum (Map.elems (Map.intersectionWith
            (\units value -> fromInteger units * value) (positions account) values))
 
@@ -390,6 +413,7 @@ matchOrder now pid oid order state
             adjust units account = Account
               (cash account - fromInteger units * price)
               (Map.filter (/= 0) (Map.insertWith (+) asset units (positions account)))
+              (Map.insertWith (+) asset (fromInteger units * price) (netSpent account))
             updateResting (who, entry)
               | restingOrderId entry /= restingOrderId maker = [(who, entry)]
               | remainingQuantity entry == quantity = []

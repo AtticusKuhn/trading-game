@@ -25,6 +25,10 @@ engineProperties =
   , prop_instrumentIsolation
   , prop_enabledInstruments
   , prop_portfolioPayoff
+  , prop_publicPortfolios
+  , prop_portfoliosTrackFills
+  , prop_portfoliosKeepSecrets
+  , prop_effectivePriceBreakEven
   , property prop_resolutionTranslation
   , property prop_populationStdDev
   , property prop_orderStatistics
@@ -40,9 +44,79 @@ prop_conservation = forAll genEngine $ \engine ->
   in conjoin
     [ property (all (== 0) (Map.elems (Map.unionsWith (+) (map positions balances))))
     , sum (map cash balances) === 0
+    , conjoin [sum (Map.elems (netSpent account)) === negate (cash account) | account <- balances]
     , property (all ((> 0) . remainingQuantity . snd) (concat (Map.elems (books state))))
     , property (all uncrossed (Map.elems (books state)))
     ]
+
+-- Every observer sees the entire roster's accounts, before and after closure.
+prop_publicPortfolios :: Property
+prop_publicPortfolios = forAll genEngine $ \engine ->
+  forAll (elements (players engine)) $ \viewer ->
+    let snapshot = exchangeSnapshot simulationStart engine
+        public = portfolios snapshot
+        closed = advanceTo (closesAt (engineInfo engine)) engine
+    in conjoin
+      [ Map.map portfolioName public === Map.fromList [(playerID p, displayName p) | p <- players engine]
+      , Map.map portfolioCash public === Map.map cash (accounts (engineBook engine))
+      , Map.map portfolioPositions public === Map.map positions (accounts (engineBook engine))
+      , conjoin
+          [ conjoin
+              [ Map.keysSet (portfolioEffectivePrices portfolio) === Map.keysSet (positions account)
+              , conjoin [fromInteger (positions account Map.! asset) * price === netSpent account Map.! asset
+                        | (asset, price) <- Map.toList (portfolioEffectivePrices portfolio)]
+              ]
+          | (pid, portfolio) <- Map.toList public, let account = accounts (engineBook engine) Map.! pid]
+      , snd (handleRequest simulationStart (playerID viewer) GetExchangeState engine) === Reply snapshot
+      , portfolios (exchangeSnapshot (closesAt (engineInfo engine)) closed) === public
+      ]
+
+-- Only the matched quantity transfers, even for partial fills and self-trades.
+prop_portfoliosTrackFills :: Property
+prop_portfoliosTrackFills = forAll genRoster $ \roster -> forAll genOrder $ \order ->
+  forAll (elements roster) $ \maker -> forAll (elements roster) $ \taker ->
+  forAll (getPositive <$> arbitrary) $ \quantity ->
+    let initial = newEngine simulationStart 60 roster
+        submit player value engine = fst (handleRequest simulationStart (playerID player) (SubmitOrder value) engine)
+        resting = submit maker order initial
+        opposite = case orderSide order of Buy -> Sell; Sell -> Buy
+        filled = submit taker (order { orderSide = opposite, orderQuantity = quantity }) resting
+        Price price = limitPrice order
+        units = (if orderSide order == Buy then 1 else -1) * min quantity (orderQuantity order)
+        expected player =
+          let amount = (if player == maker then units else 0) - (if player == taker then units else 0)
+          in PublicPortfolio (displayName player) (negate (fromInteger amount * price))
+               (Map.filter (/= 0) (Map.singleton (instrument order) amount))
+               (if amount == 0 then Map.empty else Map.singleton (instrument order) price)
+        public = portfolios . exchangeSnapshot simulationStart
+    in conjoin
+      [ public initial === Map.fromList [(playerID p, PublicPortfolio (displayName p) 0 Map.empty Map.empty) | p <- roster]
+      , public resting === public initial
+      , public filled === Map.fromList [(playerID p, expected p) | p <- roster]
+      ]
+
+-- Replacing every private number cannot affect a trading snapshot.
+prop_portfoliosKeepSecrets :: Property
+prop_portfoliosKeepSecrets = forAll genEngine $ \engine ->
+  forAll (vectorOf (length (players engine)) arbitrary) $ \secrets ->
+    exchangeSnapshot simulationStart engine === exchangeSnapshot simulationStart
+      (engine { players = zipWith (\p secret -> p { privateNumber = secret }) (players engine) secrets })
+
+-- With one instrument, liquidating at the effective price recovers all cash,
+-- including gains and losses from any previously closed positions.
+prop_effectivePriceBreakEven :: Property
+prop_effectivePriceBreakEven = forAll genRoster $ \roster ->
+  forAll (elements [minBound .. maxBound]) $ \asset ->
+  forAll (listOf ((,) <$> elements (map playerID roster) <*> genOrder)) $ \orders ->
+    let initial = newEngineWithInstruments (Set.singleton asset) simulationStart 60 roster
+        final = foldl (\engine (pid, order) -> fst (handleRequest simulationStart pid
+          (SubmitOrder order { instrument = asset }) engine)) initial orders
+    in conjoin
+      [ case Map.lookup asset (portfolioEffectivePrices portfolio) of
+          Nothing -> units === 0
+          Just price -> conjoin [property (units /= 0), portfolioCash portfolio + fromInteger units * price === 0]
+      | portfolio <- Map.elems (portfolios (exchangeSnapshot simulationStart final))
+      , let units = Map.findWithDefault 0 asset (portfolioPositions portfolio)]
 
 prop_closure :: Property
 prop_closure = forAll genEngine $ \engine ->
@@ -69,6 +143,7 @@ prop_closure = forAll genEngine $ \engine ->
           , orderBook = Map.map (const []) (books (engineBook engine))
           , tradeHistory = reverse (executedTrades (engineBook engine))
           , revealedNumbers = []
+          , portfolios = portfolios (exchangeSnapshot simulationStart engine)
           }
       ]
 
@@ -143,6 +218,8 @@ prop_instrumentIsolation = forAll genEngine $ \engine -> forAll genOrder $ \orde
       [ Map.delete asset (books after) === Map.delete asset (books before)
       , Map.map (Map.delete asset . positions) (accounts after)
           === Map.map (Map.delete asset . positions) (accounts before)
+      , Map.map (Map.delete asset . netSpent) (accounts after)
+          === Map.map (Map.delete asset . netSpent) (accounts before)
       , property (all ((== asset) . tradeInstrument) newTrades)
       ]
 

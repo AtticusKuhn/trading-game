@@ -260,8 +260,11 @@ prop_concurrentOrders scenario generated (Positive count) = liveProperty "concur
   pure $ conjoin
     [ counterexample "all orders accepted" (property (all accepted replies))
     , length (executedTrades (engineBook final)) === count
-    , accounts (engineBook final) === Map.fromList [(buyer, Account (-fromInteger volume * price) (Map.singleton (instrument order) volume)),
-        (seller, Account (fromInteger volume * price) (Map.singleton (instrument order) (-volume)))]
+    , accounts (engineBook final) === Map.fromList
+        [(buyer, Account (-fromInteger volume * price) (Map.singleton (instrument order) volume)
+          (Map.singleton (instrument order) (fromInteger volume * price)))
+        ,(seller, Account (fromInteger volume * price) (Map.singleton (instrument order) (-volume))
+          (Map.singleton (instrument order) (-fromInteger volume * price)))]
     , nextOrderId (engineBook final) === nextOrderId (engineBook initial) + 2 * toInteger count
     , counterexample "serialized trace" (replay initial trace === Right final)
     ]

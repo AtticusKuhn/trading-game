@@ -8,6 +8,22 @@ orders in different instruments never match. Accounts share cash but track a
 separate integer position in each instrument. Final payoff is
 `cash + sum (position[instrument] * resolution[instrument])`.
 
+Portfolios are public throughout the game. `ExchangeState.portfolios` maps every
+`PlayerId` (human or bot, including inactive players) to a `PublicPortfolio` with
+`portfolioName`, `portfolioCash`, and `portfolioPositions`. Missing positions mean
+zero. Cash and quantities reflect filled trades only; open orders do not reserve
+cash or holdings. Short positions and negative cash are allowed. Private numbers
+are not included in portfolios.
+
+`portfolioEffectivePrices` supplies each nonzero position's effective price:
+cumulative net spending in that instrument divided by the units currently held.
+Both interfaces show `Q @ $P` (for example, `2 @ $8`); zero holdings show only `0`,
+and cash has no effective price. Spending includes all fills in the game, even
+across closing and reopening a position, so previous gains and losses carry
+forward. Effective prices may be negative and use exact fractions when needed.
+The engine tracks spending per instrument in `Account.netSpent`; it never infers
+an instrument's price from the player's combined cash balance.
+
 Market events reveal private numbers during trading. By default an N-player
 game has N reveals, at `start + (end - start) * i / (N + 1)` for `i = 1..N`.
 The host samples a player independently for each event, uniformly from the full
@@ -108,8 +124,10 @@ profiles/private windows for different players within one game. Names select
 identities in this trusted local demo; they are not authentication credentials.
 The server binds to loopback.
 
-The game page shows your private number, open orders, recent trades, and final
-results. Prices accept integers, exact decimals, and fractions. HTMX submits
+The game page shows your private number, open orders, recent trades, public
+portfolios, and final results. The portfolio table has one row per player and
+columns for each enabled instrument and cash, and updates live with the exchange.
+Prices accept integers, exact decimals, and fractions. HTMX submits
 orders; SSE sends rendered Blaze HTML for exchange changes, directory updates,
 and scheduled starts. Streams send a full snapshot on reconnect and keep-alive
 comments every fifteen seconds. There is no client polling or custom JavaScript.
@@ -215,7 +233,8 @@ quit
 Prices and seconds accept integers, exact decimals, and fractions such as `3/2`.
 Quantities must be positive integers. Invalid input prints an error and retries;
 EOF acts as `quit`. `logout` returns to the session prompt; `quit` exits the
-terminal. Orders use `buy INSTRUMENT PRICE QUANTITY` or `sell INSTRUMENT PRICE QUANTITY`;
+terminal. `book` and automatic exchange updates include the public portfolio table.
+Orders use `buy INSTRUMENT PRICE QUANTITY` or `sell INSTRUMENT PRICE QUANTITY`;
 omitting the instrument defaults to `Sum`. `settlement` waits for closure and
 prints each enabled instrument’s resolution, your payoff,
 and every player's private number and payoff.
@@ -230,8 +249,9 @@ logout/rejoin. No OS threads or `runConcurrent` are used in simulation mode.
 
 ## Players and sessions
 
-`Player` is a record kept private until settlement, containing `playerID :: PlayerId`,
-`displayName :: String`, and `privateNumber :: Integer`. `newEngine` accepts a
+`Player` contains `playerID :: PlayerId`, `displayName :: String`, and
+`privateNumber :: Integer`. Only the private number is withheld until revealed;
+IDs and display names appear in public portfolios. `newEngine` accepts a
 fixed `[Player]`, stored as `players`; trading and session changes preserve it.
 Public exchange snapshots include scheduled revealed values, without identities,
 and keep all future reveal values private.
@@ -310,7 +330,7 @@ awaitExchangeChange
 ```
 
 The supplied snapshot is the last one observed. The request returns immediately
-if the public book, trade history, revealed numbers, or phase has changed; otherwise it waits.
+if the public book, trade history, portfolios, revealed numbers, or phase has changed; otherwise it waits.
 Passing the snapshot prevents a lost update between rendering and subscribing.
 Time passing alone and rejected orders do not count as changes. Changes can be
 coalesced for a slow consumer. After receiving a resolved snapshot, the update

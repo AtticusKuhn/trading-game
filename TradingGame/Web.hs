@@ -21,7 +21,6 @@ import Data.Char (isSpace)
 import Data.List (find, sortOn)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Ratio (denominator, numerator)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime)
@@ -37,6 +36,7 @@ import qualified Text.Blaze.Html5 as H
 import qualified Text.Blaze.Html5.Attributes as A
 import Text.Blaze.Html.Renderer.Utf8 (renderHtml)
 import TradingGame
+import TradingGame.Display (renderHolding, renderNumber)
 import TradingGame.Terminal (parseCommand)
 import Web.Cookie (parseCookies)
 
@@ -325,6 +325,17 @@ exchangeView snapshot settlement = do
         cell (show (privateNumber (settledPlayer entry)))
         cell (number (playerPayoff entry))
   panel $ do
+    H.h2 ! A.class_ "text-xl font-semibold" $ "Public portfolios"
+    H.p ! A.class_ "text-sm text-slate-600" $ "Filled trades only. Open orders are excluded. Negative quantities are short positions."
+    H.p ! A.class_ "text-sm text-slate-600" $ "Quantity @ effective price: net spending in this instrument divided by units held, including earlier gains and losses."
+    H.div ! A.id "portfolios" $ do
+      let assets = Set.toAscList (enabledInstruments (gameInfo snapshot))
+      table (["Player"] ++ map (toHtml . show) assets ++ ["Cash"]) $
+        forM_ (Map.elems (portfolios snapshot)) $ \portfolio -> H.tr $ do
+          cell (portfolioName portfolio)
+          forM_ assets $ cell . renderHolding portfolio
+          cell (number (portfolioCash portfolio))
+  panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ "Market reveals"
     H.p "Each event independently selects a player, including bots. Numbers can repeat."
     if null (revealTimes (gameInfo snapshot)) then H.p "No reveals scheduled."
@@ -372,8 +383,7 @@ cell :: String -> Html
 cell value = H.td ! A.class_ "border-b border-slate-100 py-2 pr-4 font-mono" $ toHtml value
 
 number :: Rational -> String
-number value | denominator value == 1 = show (numerator value)
-             | otherwise = show (numerator value) ++ "/" ++ show (denominator value)
+number = renderNumber
 
 priceText :: Price -> String
 priceText (Price value) = number value

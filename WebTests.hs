@@ -211,7 +211,51 @@ prop_streamClosure = forAll genEngine $ \initial -> forAll (elements (players in
         ]
 
 webProperties :: [Property]
-webProperties = [prop_instrumentViews, prop_disabledHttpOrder, prop_orderForm, prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer, prop_streamClosure]
+webProperties = [prop_portfolioTable, prop_streamPortfolios, prop_instrumentViews, prop_disabledHttpOrder, prop_orderForm, prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer, prop_streamClosure]
+
+-- A connected observer receives the complete updated portfolio table after an order.
+prop_streamPortfolios :: Property
+prop_streamPortfolios = forAll genEngine $ \initial -> forAll genOrder $ \order ->
+  forAll (elements (players initial)) $ \trader -> forAll (elements (players initial)) $ \viewer ->
+    liveProperty "SSE public portfolios" $ do
+      (clock, _) <- manualClock simulationStart
+      runtime <- newLiveRuntime clock (const (pure ())) initial
+      sessions <- newTVarIO Map.empty
+      chunks <- newTVarIO []
+      let game = WebGame runtime sessions (players initial) []
+          (_, _, stream) = responseToStream (eventStream game (BrowserSession viewer))
+          write chunk = atomically (modifyTVar' chunks (++ [toLazyByteString chunk]))
+      Async.withAsync (stream (\body -> body write (pure ()))) $ \_ -> do
+        atomically (readTVar chunks >>= check . not . null)
+        _ <- handleLiveRequest runtime (playerID trader) (SubmitOrder order)
+        snapshot <- handleLiveRequest runtime (playerID viewer) GetExchangeState
+        let expected = toLazyByteString (sseHtml "exchange" (exchangeView snapshot Nothing))
+        atomically (readTVar chunks >>= check . elem expected)
+        pure (property ("id=\"portfolios\"" `B.isInfixOf` LBS.toStrict expected))
+
+-- The public table preserves names (including HTML metacharacters), quantities,
+-- and exact cash amounts for every roster member, with any instrument selection.
+prop_portfolioTable :: Property
+prop_portfolioTable = forAll genEngine $ \engine ->
+  forAll (Set.fromList <$> sublistOf [minBound .. maxBound]) $ \enabled ->
+    let snapshot = (exchangeSnapshot simulationStart engine)
+          { gameInfo = (engineInfo engine) { enabledInstruments = enabled } }
+        html = T.decodeUtf8 (LBS.toStrict (renderHtml (exchangeView snapshot Nothing)))
+        section = snd (T.breakOn "id=\"portfolios\"" html)
+        body = fst (T.breakOn "</tbody>" (snd (T.breakOn "<tbody>" section)))
+        rows = map (filter (not . T.null) . map (T.drop 1 . snd . T.breakOn ">") . T.splitOn "<")
+          (drop 1 (T.splitOn "<tr>" body))
+        escaped = T.decodeUtf8 . LBS.toStrict . renderHtml . toHtml
+        expected =
+          [map escaped ([displayName player]
+            ++ [let units = Map.findWithDefault 0 asset (positions account)
+                in if units == 0 then "0" else show units ++ " @ $"
+                     ++ number (Map.findWithDefault 0 asset (netSpent account) / fromInteger units)
+               | asset <- Set.toAscList enabled]
+            ++ [number (cash account)])
+          | (pid, account) <- Map.toAscList (accounts (engineBook engine))
+          , player <- players engine, playerID player == pid]
+    in rows === expected
 
 -- Only enabled instruments have books and order choices in a full page or SSE.
 prop_instrumentViews :: Property

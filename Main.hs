@@ -56,7 +56,7 @@ prop_samePriceLeavesOnlyOneSide =
     forAllShrink (listOf ((\order -> order { limitPrice = price }) <$> genOrder))
       (shrinkList (const [])) $ \orders ->
         let owner = PlayerId 1
-            initial = Exchange 1 (Map.fromSet (const []) allInstruments) [] (Map.singleton owner (Account 0 Map.empty))
+            initial = Exchange 1 (Map.fromSet (const []) allInstruments) [] (Map.singleton owner (Account 0 Map.empty Map.empty))
             submit state (oid, order) =
               matchOrder simulationStart owner oid order state
             final = foldl' submit initial (zip (map OrderId [1..]) orders)

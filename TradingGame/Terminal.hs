@@ -9,13 +9,15 @@ module TradingGame.Terminal
 import Control.Effect (Eff, IOE, (:<), interpret, liftIO)
 import Control.Monad (void)
 import Data.Char (isDigit, isSpace, toLower)
-import Data.List (find)
+import Data.List (find, intercalate)
 import qualified Data.Map.Strict as Map
-import Data.Ratio ((%), numerator, denominator)
+import qualified Data.Set as Set
+import Data.Ratio ((%))
 import System.IO (hFlush, isEOF, stdout)
 import Text.Read (readMaybe)
 import TradingGame.Concurrent
 import TradingGame.Core
+import TradingGame.Display (renderHolding, renderNumber)
 import TradingGame.Interaction
 import TradingGame.Live (LiveRuntime, runWithCurrentPlayer)
 import TradingGame.Session
@@ -127,7 +129,21 @@ parseNumber input = case input of
 renderInfo :: PlayerInfo -> String
 renderInfo info = case info of
   PrivateNumber value -> "Your private number: " ++ show value
-  ExchangeSnapshot snapshot -> show snapshot
+  ExchangeSnapshot snapshot ->
+    let assets = Set.toAscList (enabledInstruments (gameInfo snapshot))
+        row = intercalate " | "
+    in unlines $
+      [ "Exchange: " ++ show (gamePhase snapshot) ++ "; observed at: " ++ show (observedAt snapshot)
+      , "Game: " ++ show (gameInfo snapshot)
+      , "Books: " ++ show (orderBook snapshot)
+      , "Trades: " ++ show (tradeHistory snapshot)
+      , "Revealed numbers: " ++ show (revealedNumbers snapshot)
+      , "Public portfolios (filled trades only):"
+      , row (["Player"] ++ map show assets ++ ["Cash"])
+      ] ++ [row ([portfolioName portfolio]
+            ++ map (renderHolding portfolio) assets
+            ++ [renderRational (portfolioCash portfolio)])
+           | portfolio <- Map.elems (portfolios snapshot)]
   OrderSubmitted (Right oid) -> "Order accepted: " ++ show oid
   OrderSubmitted (Left problem) -> "Order rejected: " ++ show problem
   PlayerSettlement result -> "Resolutions: " ++ unwords [show asset ++ "=" ++ renderRational value
@@ -138,5 +154,4 @@ renderInfo info = case info of
       ++ "; payoff: " ++ renderRational (playerPayoff entry)) (playerResults result)
   HelpInfo -> commandHelp
   where
-    renderRational n | denominator n == 1 = show (numerator n)
-                     | otherwise = show (numerator n) ++ "/" ++ show (denominator n)
+    renderRational = renderNumber
