@@ -16,6 +16,7 @@ import Control.Monad (void)
 import Data.Time.Clock (NominalDiffTime)
 import System.Random (randomRIO)
 import Data.Maybe (isJust)
+import Data.Ratio (denominator, numerator)
 import LiveTests (liveProperty, manualClock)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -55,8 +56,11 @@ orderFields :: LimitOrder -> [(B.ByteString, B.ByteString)]
 orderFields order =
   [("side", if orderSide order == Buy then "buy" else "sell")
   ,("instrument", B.pack (show (instrument order)))
-  ,("price", B.pack (priceText (limitPrice order)))
+  ,("price", B.pack (show (numerator value) ++ "/" ++ show (denominator value)))
   ,("quantity", B.pack (show (orderQuantity order)))]
+  where
+    -- Submit exact inputs; display formatting intentionally rounds prices.
+    Price value = limitPrice order
 
 -- Arbitrary valid orders cannot change any exchange state without a session.
 prop_requiresSession :: Property

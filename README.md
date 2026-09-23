@@ -20,7 +20,8 @@ cumulative net spending in that instrument divided by the units currently held.
 Both interfaces show `Q @ $P` (for example, `2 @ $8`); zero holdings show only `0`,
 and cash has no effective price. Spending includes all fills in the game, even
 across closing and reopening a position, so previous gains and losses carry
-forward. Effective prices may be negative and use exact fractions when needed.
+forward. Effective prices may be negative. Displayed values are rounded to at
+most two decimal places; calculations retain exact fractions internally.
 The engine tracks spending per instrument in `Account.netSpent`; it never infers
 an instrument's price from the player's combined cash balance.
 

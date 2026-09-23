@@ -133,10 +133,11 @@ renderInfo info = case info of
     let assets = Set.toAscList (enabledInstruments (gameInfo snapshot))
         row = intercalate " | "
     in unlines $
-      [ "Exchange: " ++ show (gamePhase snapshot) ++ "; observed at: " ++ show (observedAt snapshot)
+      [ "Exchange: " ++ renderPhase (gamePhase snapshot) ++ "; observed at: " ++ show (observedAt snapshot)
       , "Game: " ++ show (gameInfo snapshot)
-      , "Books: " ++ show (orderBook snapshot)
-      , "Trades: " ++ show (tradeHistory snapshot)
+      , "Books: " ++ intercalate "; " [show asset ++ ": " ++ intercalate ", " (map renderOrder entries)
+          | (asset, entries) <- Map.toAscList (orderBook snapshot)]
+      , "Trades: " ++ intercalate "; " (map renderTrade (tradeHistory snapshot))
       , "Revealed numbers: " ++ show (revealedNumbers snapshot)
       , "Public portfolios (filled trades only):"
       , row (["Player"] ++ map show assets ++ ["Cash"])
@@ -155,3 +156,11 @@ renderInfo info = case info of
   HelpInfo -> commandHelp
   where
     renderRational = renderNumber
+    renderPhase Trading = "Trading"
+    renderPhase (Resolved values) = "Resolved " ++ unwords
+      [show asset ++ "=" ++ renderNumber value | (asset, value) <- Map.toAscList values]
+    renderPrice (Price value) = renderNumber value
+    renderOrder entry = show (restingOrderId entry) ++ " " ++ show (restingSide entry)
+      ++ " " ++ show (remainingQuantity entry) ++ " @ $" ++ renderPrice (restingPrice entry)
+    renderTrade entry = show (tradeInstrument entry) ++ " " ++ show (tradeQuantity entry)
+      ++ " @ $" ++ renderPrice (tradePrice entry) ++ " at " ++ show (tradedAt entry)
