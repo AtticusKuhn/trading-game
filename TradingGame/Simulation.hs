@@ -7,6 +7,7 @@ module TradingGame.Simulation where
 import Control.Effect (Eff, lift, send)
 import qualified Control.Effect.State.Strict as State
 import TradingGame.Concurrent (Concurrent)
+import Data.Set (Set)
 import Data.List (sortOn, partition)
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime(..), NominalDiffTime)
@@ -36,8 +37,15 @@ runTradingGameAt' :: UTCTime -> NominalDiffTime -> [PlayerProgram effs] -> Eff e
 runTradingGameAt' start duration = fmap engineBook . simulatePlayers start duration
 
 simulatePlayers :: UTCTime -> NominalDiffTime -> [PlayerProgram effs] -> Eff effs Engine
-simulatePlayers start duration programs =
-  let initial = newEngine start duration (map fst programs)
+simulatePlayers = simulatePlayersWithInstruments allInstruments
+
+runTradingGameWithInstruments :: Set Instrument -> UTCTime -> NominalDiffTime -> [PlayerProgram effs] -> Eff effs [Settlement]
+runTradingGameWithInstruments enabled start duration =
+  fmap engineSettlements . simulatePlayersWithInstruments enabled start duration
+
+simulatePlayersWithInstruments :: Set Instrument -> UTCTime -> NominalDiffTime -> [PlayerProgram effs] -> Eff effs Engine
+simulatePlayersWithInstruments enabled start duration programs =
+  let initial = newEngineWithInstruments enabled start duration (map fst programs)
       -- Stable sorting keeps closure ahead of wake-ups at the deadline.
       events = (closesAt (engineInfo initial), CloseExchange) :
         [(start, ResumeTask (Activity (playerID player) [] (preparePlayer program)))

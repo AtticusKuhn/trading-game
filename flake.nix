@@ -166,10 +166,10 @@
           '';
           web = project.web;
           terminal = project.pkgs.runCommand "trading-game-terminal-check" { } ''
-            printf 'join alice\nprivate\nbuy 11 2\nlogout\njoin alice\nbook\nsettlement\nquit\n' | \
+            printf 'join alice\nprivate\nbuy Sum 11 2\nlogout\njoin alice\nbook\nsettlement\nquit\n' | \
               ${project.terminal}/bin/trading-game-terminal sim > "$out"
             grep -q 'Order accepted' "$out"
-            grep -q 'Resolved sum: 10; your payoff: -2' "$out"
+            grep -q 'Resolutions: Sum=10 .*; your payoff: -2' "$out"
           '';
         });
     };

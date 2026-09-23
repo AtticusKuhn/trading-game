@@ -10,6 +10,7 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (evaluate)
 import Control.Monad (when)
+import Data.Set (Set)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, diffUTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTimeNSec)
 import TradingGame.Concurrent
@@ -51,13 +52,14 @@ data LiveEvent where
 
 data LiveConfig = LiveConfig
   { liveDuration :: NominalDiffTime
+  , liveInstruments :: Set Instrument
   -- Runs under the engine lock. Keep it short; exceptions abort the run.
   -- Traces are private to the host, including private-number replies.
   , onLiveEvent :: LiveEvent -> IO ()
   }
 
 defaultLiveConfig :: LiveConfig
-defaultLiveConfig = LiveConfig 3600 (const (pure ()))
+defaultLiveConfig = LiveConfig 3600 allInstruments (const (pure ()))
 
 data LiveRuntime = LiveRuntime
   { runtimeClock :: LiveClock
@@ -164,7 +166,7 @@ runLiveWith clock config programs = engineSettlements <$> runLiveEngineWith cloc
 runLiveEngineWith :: (IOE :< effs, Concurrent :< effs) => LiveClock -> LiveConfig -> [PlayerProgram effs] -> Eff effs Engine
 runLiveEngineWith clock config programs = do
   start <- liftIO (clockNow clock)
-  let initial = newEngine start (liveDuration config)
+  let initial = newEngineWithInstruments (liveInstruments config) start (liveDuration config)
         (map fst programs)
   runtime <- liftIO (newLiveRuntime clock (onLiveEvent config) initial)
   let worker = runLivePlayer runtime

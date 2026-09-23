@@ -97,3 +97,32 @@ Right now, we're just storing everything in
 in-memory data structures for simplicity. 
 We may add a database (e.g. SQLite) in the future,
 but not yet.
+
+# Tradable Instruments
+
+```haskell
+data Instrument  = Sum | Range | Min | Max | Median | StdDev -- StdDev is population standard deviation, not sample standard deviation.
+    deriving (Eq, Ord, Show, Enum, Bounded)
+
+  type Positions   = Map Instrument Integer
+
+resolve :: Instrument -> [Integer] -> Rational
+resolve Sum = sum
+resolve Max = maxmimum
+resolve Min = minimum
+
+```
+
+A player’s final payoff becomes:
+
+`cash + Σ(position[instrument] × resolution[instrument])`
+
+Note that each instrument resolves on its own independent order-book, so for example, a sell of `Sum` would 
+not resolve with buy of `Range`.
+
+
+# Limits 
+All players start off with `0` cash, but
+there are no limits on the amount of buying or
+selling. A player may have negative cash and 
+still trade.

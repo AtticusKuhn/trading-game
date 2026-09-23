@@ -11,6 +11,8 @@ import Control.Effect (Eff, IOE, runIO)
 import qualified Data.ByteString.Char8 as B
 import Data.ByteString.Builder (toLazyByteString)
 import qualified Data.ByteString.Lazy as LBS
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.List (sortOn)
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as T
@@ -32,13 +34,14 @@ manage manager = runIO . runManageGames manager
 
 genConfig :: Gen NewGameConfig
 genConfig = do
+  enabled <- Set.fromList <$> sublistOf [minBound .. maxBound]
   roster <- genRoster
   types <- vectorOf (length roster) (elements [HumanPlayer, RandomTradingBot, MarketMakingBot])
   offset <- arbitrary
   Positive duration <- arbitrary
   let start = addUTCTime (fromInteger offset) simulationStart
   pure (NewGameConfig start (addUTCTime (fromInteger duration) start)
-    (zipWith (RosterEntry . displayName) roster types))
+    (zipWith (RosterEntry . displayName) roster types) enabled)
 
 shrinkConfig :: NewGameConfig -> [NewGameConfig]
 shrinkConfig config =
@@ -83,10 +86,12 @@ prop_window = forAllShrink (humans <$> genConfig) shrinkConfig $ \config -> live
         pure $ conjoin
           [ opensAt (engineInfo engine) === gameStart config
           , closesAt (engineInfo engine) === gameEnd config
+          , enabledInstruments (engineInfo engine) === gameInstruments config
+          , Map.keysSet (books (engineBook engine)) === gameInstruments config
           , map displayName (players engine) === map rosterName (gameRoster config)
-          , map fst (accounts (engineBook engine)) === map playerID (players engine)
+          , Map.keysSet (accounts (engineBook engine)) === Set.fromList (map playerID (players engine))
           , property (all (\p -> privateNumber p >= 1 && privateNumber p <= 9) (players engine))
-          , enginePhase engine === if expected == Completed then Resolved (engineTotal engine) else Trading
+          , enginePhase engine === if expected == Completed then Resolved (engineResolutions engine) else Trading
           ]
     pure $ conjoin [summaryStatus summary === expected, isJust active === (expected /= Upcoming), engineChecks]
 
@@ -111,8 +116,8 @@ prop_automaticLifecycle = forAllShrink genConfig shrinkConfig $ \generated ->
       pure $ conjoin
         [ property (isNothing before)
         , players final === players initial
-        , enginePhase final === Resolved (engineTotal initial)
-        , map fst (accounts (engineBook final)) === map playerID (players initial)
+        , enginePhase final === Resolved (engineResolutions initial)
+        , Map.keysSet (accounts (engineBook final)) === Set.fromList (map playerID (players initial))
         ]
 
 -- Mutating one exchange cannot affect another, even with identical names/IDs.
@@ -148,6 +153,8 @@ prop_invalidConfig = forAllShrink genConfig shrinkConfig $ \config ->
 
 configFields :: NewGameConfig -> [(B.ByteString, B.ByteString)]
 configFields config = [("start", stamp (gameStart config)), ("end", stamp (gameEnd config))]
+  ++ [("instruments-present", "yes")]
+  ++ [("instrument", B.pack (show asset)) | asset <- Set.toAscList (gameInstruments config)]
   ++ concat [[("player-name", T.encodeUtf8 (T.pack (rosterName entry))), ("player-type", kind (rosterType entry))]
             | entry <- gameRoster config]
   where
@@ -232,4 +239,13 @@ prop_startStream = forAllShrink genConfig shrinkConfig $ \config ->
 
 manageGamesProperties :: [Property]
 manageGamesProperties = [prop_directory, prop_window, prop_automaticLifecycle, prop_isolation,
-  prop_invalidConfig, prop_creationForm, prop_httpIsolation, prop_playerTypes, prop_futureHTTP, prop_startStream]
+  prop_invalidConfig, prop_creationForm, prop_defaultInstruments, prop_httpIsolation, prop_playerTypes, prop_futureHTTP, prop_startStream]
+
+-- An omitted selection uses the default; an explicit empty selection stays empty.
+prop_defaultInstruments :: Property
+prop_defaultInstruments = forAll genConfig $ \config ->
+  let fields = filter (\(key, _) -> key /= "instruments-present" && key /= "instrument") (configFields config)
+  in conjoin
+    [ fmap gameInstruments (parseNewGameForm fields) === Right allInstruments
+    , fmap gameInstruments (parseNewGameForm (("instruments-present", "yes") : fields)) === Right Set.empty
+    ]

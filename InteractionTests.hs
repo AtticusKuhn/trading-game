@@ -10,6 +10,8 @@ import Control.Concurrent.STM
 import Control.Effect (Eff, interpret, lift, liftIO, run, runIO)
 import qualified Control.Effect.State.Strict as State
 import Control.Monad (void)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Ratio ((%))
 import Test.QuickCheck
 import LiveTests (manualClock, liveProperty)
@@ -71,19 +73,20 @@ prop_automaticSettlement (Positive duration) (Positive later) = forAll genRoster
         runTradingGameFor (fromInteger duration) [(player, void interactivePlayer)]
   in conjoin
     [ [value | PlayerSettlement value <- output] === settlements
-    , [gamePhase value | ExchangeSnapshot value <- output] === [Trading, Resolved (privateNumber player)]
+    , [gamePhase value | ExchangeSnapshot value <- output] === [Trading, Resolved (Map.fromSet (\asset -> resolve asset [privateNumber player]) allInstruments)]
     ]
 
 -- The same player and input produce the same command replies under pure
 -- scheduling and real threads. The live transport uses STM for shared output.
 prop_liveSimulationReplies :: Positive Integer -> Property
 prop_liveSimulationReplies (Positive duration) = forAll genRoster $ \roster ->
+  forAll (Set.fromList <$> sublistOf [minBound .. maxBound]) $ \enabled ->
   forAll genCommands $ \commands -> liveProperty "shared interactive player replies" $ do
     let player = head roster
         input = commands ++ [Quit]
-        initial = newEngine simulationStart (fromInteger duration) [player]
+        initial = newEngineWithInstruments enabled simulationStart (fromInteger duration) [player]
         ((_, expected), _) = run $ runScript input $
-          runTradingGameFor (fromInteger duration) [(player, void interactivePlayer)]
+          runTradingGameWithInstruments enabled simulationStart (fromInteger duration) [(player, void interactivePlayer)]
     (clock, _) <- manualClock simulationStart
     runtime <- newLiveRuntime clock (const (pure ())) initial
     transport <- newTVarIO (input, [])
@@ -100,8 +103,9 @@ prop_liveSimulationReplies (Positive duration) = forAll genRoster $ \roster ->
 
 prop_parsePrices :: Integer -> Positive Integer -> Positive Integer -> Property
 prop_parsePrices n (Positive d) (Positive quantity) =
-  let command = "buy " ++ show n ++ "/" ++ show d ++ " " ++ show quantity
-  in parseCommand command === Right (PlaceOrder (LimitOrder Buy (Price (n % d)) quantity))
+  forAll (elements [minBound .. maxBound]) $ \asset ->
+    let command = "buy " ++ show asset ++ " " ++ show n ++ "/" ++ show d ++ " " ++ show quantity
+    in parseCommand command === Right (PlaceOrder (LimitOrder Buy (Price (n % d)) asset quantity))
 
 prop_invalidCommands :: Property
 prop_invalidCommands = conjoin
@@ -110,4 +114,4 @@ prop_invalidCommands = conjoin
       Right _ -> False
   | command <- ["", "buy 1/0 1", "buy NaN 1", "sell Infinity 1", "buy 2 0",
                 "sell 2 -1", "buy 2 1.5", "wait -1", "wait 1/0", "quit extra"]
-  ] .&&. (parseCommand "sell -1.25 2" === Right (PlaceOrder (LimitOrder Sell (Price ((-5) % 4)) 2)))
+  ] .&&. (parseCommand "sell -1.25 2" === Right (PlaceOrder (LimitOrder Sell (Price ((-5) % 4)) Sum 2)))

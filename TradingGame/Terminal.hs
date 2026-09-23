@@ -8,7 +8,9 @@ module TradingGame.Terminal
 
 import Control.Effect (Eff, IOE, (:<), interpret, liftIO)
 import Control.Monad (void)
-import Data.Char (isDigit, isSpace)
+import Data.Char (isDigit, isSpace, toLower)
+import Data.List (find)
+import qualified Data.Map.Strict as Map
 import Data.Ratio ((%), numerator, denominator)
 import System.IO (hFlush, isEOF, stdout)
 import Text.Read (readMaybe)
@@ -73,8 +75,9 @@ runTerminal = interpret $ \request -> case request of
 
 commandHelp :: String
 commandHelp = unlines
-  [ "Commands: buy PRICE QUANTITY | sell PRICE QUANTITY"
+  [ "Commands: buy INSTRUMENT PRICE QUANTITY | sell INSTRUMENT PRICE QUANTITY"
   , "          private | book | wait SECONDS | settlement | help | logout | quit"
+  , "Instruments: Sum Range Min Max Median StdDev (omitting it defaults to Sum)."
   , "Prices and seconds accept integers, decimals, or fractions (e.g. 3/2)."
   , "settlement waits for closure; logout returns to joining; quit (or EOF) exits."
   ]
@@ -91,10 +94,12 @@ parseCommand line = case words line of
     Just n | n >= 0 -> Right (WaitFor (fromRational n))
     _ -> Left "Expected a nonnegative number of seconds."
   [side, price, quantity] | side == "buy" || side == "sell" ->
-    case (parseNumber price, readMaybe quantity) of
-      (Just p, Just q) | q > 0 -> Right $ PlaceOrder $
-        LimitOrder (if side == "buy" then Buy else Sell) (Price p) q
-      _ -> Left "Expected a numeric price and a positive integer quantity."
+    parseCommand (unwords [side, "Sum", price, quantity])
+  [side, asset, price, quantity] | side == "buy" || side == "sell" ->
+    case (find ((== map toLower asset) . map toLower . show) [minBound .. maxBound], parseNumber price, readMaybe quantity) of
+      (Just selected, Just p, Just q) | q > 0 -> Right $ PlaceOrder $
+        LimitOrder (if side == "buy" then Buy else Sell) (Price p) selected q
+      _ -> Left "Expected a known instrument, numeric price, and positive integer quantity."
   _ -> Left ("Unrecognized command. " ++ commandHelp)
 
 -- Parse exact prices without introducing floating-point rounding or accepting
@@ -125,7 +130,8 @@ renderInfo info = case info of
   ExchangeSnapshot snapshot -> show snapshot
   OrderSubmitted (Right oid) -> "Order accepted: " ++ show oid
   OrderSubmitted (Left problem) -> "Order rejected: " ++ show problem
-  PlayerSettlement result -> "Resolved sum: " ++ show (resolvedSum result)
+  PlayerSettlement result -> "Resolutions: " ++ unwords [show asset ++ "=" ++ renderRational value
+      | (asset, value) <- Map.toAscList (resolutions result)]
     ++ "; your payoff: " ++ renderRational (netPayoff result)
     ++ concatMap (\entry -> "\n" ++ displayName (settledPlayer entry)
       ++ "; private number: " ++ show (privateNumber (settledPlayer entry))

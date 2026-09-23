@@ -6,7 +6,7 @@
 -- Scheduling belongs to the host. No LiveRuntime exists before a game's start.
 module TradingGame.ManageGames
   ( ManageGames(..), GameId(..), PlayerType(..), RosterEntry(..)
-  , NewGameConfig(..), CreateGameError(..), GameStatus(..), GameSummary(..)
+  , NewGameConfig(..), defaultNewGameConfig, CreateGameError(..), GameStatus(..), GameSummary(..)
   , GameManager, withGameManager, runManageGames
   , createNewGame, lookupGame, listAllGames
   , gameRuntime, gameRevision
@@ -21,6 +21,7 @@ import Control.Monad (void)
 import Data.Char (isSpace)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
 import Data.Time.Clock (UTCTime, diffUTCTime)
 import System.Random (StdGen, newStdGen, randomRIO)
 import TradingGame.Bots
@@ -38,7 +39,13 @@ data NewGameConfig = NewGameConfig
   { gameStart :: UTCTime
   , gameEnd :: UTCTime
   , gameRoster :: [RosterEntry]
+  , gameInstruments :: Set Instrument
   } deriving (Eq, Show)
+
+-- Hosts can override the instrument set before submitting the configuration.
+defaultNewGameConfig :: UTCTime -> UTCTime -> [RosterEntry] -> NewGameConfig
+defaultNewGameConfig start end roster = NewGameConfig start end roster allInstruments
+
 data CreateGameError = InvalidTimeWindow | EmptyRoster | BlankPlayerName
   | DuplicatePlayerNames | ManagerClosed deriving (Eq, Show)
 
@@ -121,7 +128,7 @@ createGameIO manager config = case validate config of
       failure <- newTVarIO Nothing
       let gid = GameId (registryNext registry)
           game = ManagedGame config
-            (newEngine (gameStart config) (diffUTCTime (gameEnd config) (gameStart config)) roster)
+            (newEngineWithInstruments (gameInstruments config) (gameStart config) (diffUTCTime (gameEnd config) (gameStart config)) roster)
             seeds runtime failure
       -- Immediate games are available before creation returns, even if already expired.
       void (activate manager game)

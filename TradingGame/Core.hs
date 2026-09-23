@@ -9,7 +9,12 @@ module TradingGame.Core where
 
 import Control.Effect (Eff, Effect, (:<), send)
 import Data.Char (isSpace)
-import Data.List (find, nub, sortOn)
+import Data.List (find, nub, sort, sortOn)
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
+import qualified Data.Set as Set
+import Data.Set (Set)
+import Data.Ratio ((%), numerator, denominator)
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 
 newtype PlayerId = PlayerId Integer deriving (Eq, Ord, Show)
@@ -24,12 +29,62 @@ data Player = Player
 newtype OrderId = OrderId Integer deriving (Eq, Ord, Show)
 newtype Price = Price Rational deriving (Eq, Ord, Show)
 
--- Assumption: limit orders for positive quantities of a single contract on S.
+data Instrument = Sum | Range | Min | Max | Median | StdDev
+  deriving (Eq, Ord, Show, Read, Enum, Bounded)
+
+allInstruments :: Set Instrument
+allInstruments = Set.fromList [minBound .. maxBound]
+
+type Positions = Map Instrument Integer
+type Resolutions = Map Instrument Rational
+
+data Account = Account
+  { cash :: Rational
+  , positions :: Positions
+  } deriving (Eq, Show)
+
+-- The host guarantees a nonempty roster. Median averages the middle pair.
+-- Population standard deviation rounds to the nearest millionth (ties up).
+-- Integer arithmetic avoids overflow and cancellation for large private numbers.
+resolve :: Instrument -> [Integer] -> Rational
+resolve _ [] = error "resolve: empty player roster"
+resolve asset values = case asset of
+  Sum -> fromInteger (sum values)
+  Range -> fromInteger (maximum values - minimum values)
+  Min -> fromInteger (minimum values)
+  Max -> fromInteger (maximum values)
+  Median -> let ordered = sort values
+                middle = length values `div` 2
+            in if odd (length values) then fromInteger (ordered !! middle)
+               else (ordered !! (middle - 1) + ordered !! middle) % 2
+  StdDev -> roundedSquareRoot variance
+  where
+    count = toInteger (length values)
+    mean = sum values % count
+    variance = sum [(fromInteger value - mean) ^ (2 :: Int) | value <- values] / fromInteger count
+
+roundedSquareRoot :: Rational -> Rational
+roundedSquareRoot value =
+  let scale = 1000000
+      scaled = value * fromInteger (scale * scale)
+      lower = integerSquareRoot (numerator scaled `div` denominator scaled)
+      rounded = if scaled >= (2 * lower + 1) ^ (2 :: Int) % 4 then lower + 1 else lower
+  in rounded % scale
+
+integerSquareRoot :: Integer -> Integer
+integerSquareRoot n
+  | n < 0 = error "integerSquareRoot: negative input"
+  | n == 0 = 0
+  | otherwise = descend n
+  where
+    descend x = let next = (x + n `div` x) `div` 2
+                in if next >= x then x else descend next
+
 -- A buy specifies the maximum price; a sell specifies the minimum price.
--- Price units are the same as S; prices may be negative if S can be negative.
 data LimitOrder = LimitOrder
   { orderSide :: Side
   , limitPrice :: Price
+  , instrument :: Instrument
   , orderQuantity :: Integer
   } deriving (Eq, Show)
 
@@ -47,11 +102,12 @@ data GameInfo = GameInfo
   { playerCount :: Int
   , opensAt :: UTCTime
   , closesAt :: UTCTime
+  , enabledInstruments :: Set Instrument
   } deriving (Eq, Show)
 
--- The sum and individual numbers are revealed only once the game resolves.
+-- The resolutions and individual numbers are revealed only once the game resolves.
 -- Outstanding orders expire at the deadline.
-data GamePhase = Trading | Resolved Integer deriving (Eq, Show)
+data GamePhase = Trading | Resolved Resolutions deriving (Eq, Show)
 
 -- Public order book entries contain the unfilled quantity, not private numbers.
 data RestingOrder = RestingOrder
@@ -62,7 +118,8 @@ data RestingOrder = RestingOrder
   } deriving (Eq, Show)
 
 data Trade = Trade
-  { tradePrice :: Price
+  { tradeInstrument :: Instrument
+  , tradePrice :: Price
   , tradeQuantity :: Integer
   , tradedAt :: UTCTime
   } deriving (Eq, Show)
@@ -73,18 +130,19 @@ data ExchangeState = ExchangeState
   { gameInfo :: GameInfo
   , observedAt :: UTCTime
   , gamePhase :: GamePhase
-  , orderBook :: [RestingOrder]
+  , orderBook :: Map Instrument [RestingOrder]
   , tradeHistory :: [Trade]
   } deriving (Eq, Show)
 
-data OrderError = GameClosed | InvalidQuantity deriving (Eq, Show)
+data OrderError = GameClosed | InvalidQuantity | InstrumentDisabled deriving (Eq, Show)
 
 -- Acceptance does not imply execution: an order may fill partially or rest.
 -- The interpreter below uses price/time priority and the resting order price.
 -- It allows unlimited positions and self-trades.
 type OrderResult = Either OrderError OrderId
 
--- One filled unit bought at price P pays S - P; a sale pays P - S.
+-- One bought unit pays its resolution minus its execution price; a sale pays
+-- the opposite.
 -- Unfilled orders have no payoff. Every caller sees the complete final roster.
 data PlayerResult = PlayerResult
   { settledPlayer :: Player
@@ -92,7 +150,7 @@ data PlayerResult = PlayerResult
   } deriving (Eq, Show)
 
 data Settlement = Settlement
-  { resolvedSum :: Integer
+  { resolutions :: Resolutions
   , netPayoff :: Rational
   , playerResults :: [PlayerResult]
   } deriving (Eq, Show)
@@ -135,12 +193,13 @@ waitUntil = send . WaitUntil
 
 
 -- Host-only state. The list order breaks ties between orders at the same price.
--- Accounts hold (net units bought, cash received); shorts are negative units.
+-- Accounts share cash across instruments; short positions are negative units.
+type OrderBook = [(PlayerId, RestingOrder)]
 data Exchange = Exchange
   { nextOrderId :: Integer
-  , ownedOrders :: [(PlayerId, RestingOrder)]
+  , books :: Map Instrument OrderBook
   , executedTrades :: [Trade]
-  , accounts :: [(PlayerId, (Integer, Rational))]
+  , accounts :: Map PlayerId Account
   } deriving (Eq, Show)
 
 -- All trading rules operate on this host-only state. Times supplied to the
@@ -166,7 +225,10 @@ deriving instance Show a => Show (Decision a)
 -- Names are exact, case-sensitive identities. Reject ambiguous rosters up front.
 -- Nonpositive durations produce a game that is closed at its start.
 newEngine :: UTCTime -> NominalDiffTime -> [Player] -> Engine
-newEngine start duration roster
+newEngine = newEngineWithInstruments allInstruments
+
+newEngineWithInstruments :: Set Instrument -> UTCTime -> NominalDiffTime -> [Player] -> Engine
+newEngineWithInstruments enabled start duration roster
   | null roster = error "newEngine: empty player roster"
   | length (nub (map playerID roster)) /= length roster =
       error "newEngine: duplicate player IDs"
@@ -174,14 +236,17 @@ newEngine start duration roster
       error "newEngine: duplicate display names"
   | any (all isSpace . displayName) roster = error "newEngine: empty display name"
   | otherwise = Engine
-      { engineInfo = GameInfo (length roster) start (addUTCTime (max 0 duration) start)
+      { engineInfo = GameInfo (length roster) start (addUTCTime (max 0 duration) start) enabled
       , players = roster
       , enginePhase = Trading
-      , engineBook = Exchange 1 [] [] [(playerID player, (0, 0)) | player <- roster]
+      , engineBook = Exchange 1 (Map.fromSet (const []) enabled) []
+          (Map.fromList [(playerID player, Account 0 Map.empty) | player <- roster])
       }
 
-engineTotal :: Engine -> Integer
-engineTotal = sum . map privateNumber . players
+engineResolutions :: Engine -> Resolutions
+engineResolutions engine = Map.fromSet
+  (\asset -> resolve asset (map privateNumber (players engine)))
+  (enabledInstruments (engineInfo engine))
 
 engineSettlements :: Engine -> [Settlement]
 engineSettlements engine =
@@ -191,8 +256,8 @@ engineSettlements engine =
 advanceTo :: UTCTime -> Engine -> Engine
 advanceTo now engine = case enginePhase engine of
   Trading | now >= closesAt (engineInfo engine) -> engine
-    { enginePhase = Resolved (engineTotal engine)
-    , engineBook = (engineBook engine) { ownedOrders = [] }
+    { enginePhase = Resolved (engineResolutions engine)
+    , engineBook = (engineBook engine) { books = Map.map (const []) (books (engineBook engine)) }
     }
   _ -> engine
 
@@ -216,6 +281,7 @@ handleRequest now pid request initial =
     SubmitOrder order -> case enginePhase engine of
       Resolved _ -> answer (Left GameClosed)
       Trading
+        | instrument order `Set.notMember` enabledInstruments (engineInfo engine) -> answer (Left InstrumentDisabled)
         | orderQuantity order <= 0 -> answer (Left InvalidQuantity)
         | otherwise ->
             let oid = OrderId (nextOrderId state)
@@ -239,54 +305,63 @@ exchangeSnapshot now engine = ExchangeState
   { gameInfo = engineInfo engine
   , observedAt = now
   , gamePhase = enginePhase engine
-  , orderBook = map snd (ownedOrders (engineBook engine))
+  , orderBook = Map.map (map snd) (books (engineBook engine))
   , tradeHistory = reverse (executedTrades (engineBook engine))
   }
 
 -- Host-only helper; interpreters call this after resolution.
 settlementFor :: PlayerId -> Engine -> Settlement
 settlementFor pid engine = Settlement
-  { resolvedSum = total
+  { resolutions = values
   , netPayoff = payoff pid
   , playerResults = [PlayerResult player (payoff (playerID player)) | player <- players engine]
   }
   where
-    total = engineTotal engine
+    values = case enginePhase engine of
+      Resolved resolved -> resolved
+      Trading -> error "settlementFor: game has not resolved"
     payoff who =
-      let (units, cash) = maybe (0, 0) id (lookup who (accounts (engineBook engine)))
-      in cash + fromInteger (units * total)
+      let account = Map.findWithDefault (Account 0 Map.empty) who (accounts (engineBook engine))
+      in cash account + sum (Map.elems (Map.intersectionWith
+           (\units value -> fromInteger units * value) (positions account) values))
 
 -- Match against the best eligible price, then the oldest order at that price.
 -- An incoming order's remainder rests until matched or the game closes.
 matchOrder :: UTCTime -> PlayerId -> OrderId -> LimitOrder -> Exchange -> Exchange
 matchOrder now pid oid order state
+  | instrument order `Map.notMember` books state = state
   | orderQuantity order == 0 = state
   | otherwise = case sortOn priority eligible of
-      [] -> state { ownedOrders = ownedOrders state ++ [(pid, resting)] }
+      [] -> state { books = Map.insert asset (book ++ [(pid, resting)]) (books state) }
       (owner, maker) : _ ->
         let quantity = min (orderQuantity order) (remainingQuantity maker)
             Price price = restingPrice maker
             signed = if orderSide order == Buy then quantity else negate quantity
-            updateAccount (who, (units, cash))
-              | pid == owner = (who, (units, cash))
-              | who == pid = (who, (units + signed, cash - fromInteger signed * price))
-              | who == owner = (who, (units - signed, cash + fromInteger signed * price))
-              | otherwise = (who, (units, cash))
+            updateAccount who account
+              | pid == owner = account
+              | who == pid = adjust signed account
+              | who == owner = adjust (negate signed) account
+              | otherwise = account
+            adjust units account = Account
+              (cash account - fromInteger units * price)
+              (Map.filter (/= 0) (Map.insertWith (+) asset units (positions account)))
             updateResting (who, entry)
               | restingOrderId entry /= restingOrderId maker = [(who, entry)]
               | remainingQuantity entry == quantity = []
               | otherwise = [(who, entry
                   { remainingQuantity = remainingQuantity entry - quantity })]
             updated = state
-              { ownedOrders = concatMap updateResting (ownedOrders state)
-              , executedTrades = Trade (restingPrice maker) quantity now : executedTrades state
-              , accounts = map updateAccount (accounts state)
+              { books = Map.insert asset (concatMap updateResting book) (books state)
+              , executedTrades = Trade asset (restingPrice maker) quantity now : executedTrades state
+              , accounts = Map.mapWithKey updateAccount (accounts state)
               }
         in matchOrder now pid oid
              order { orderQuantity = orderQuantity order - quantity } updated
   where
+    asset = instrument order
+    book = Map.findWithDefault [] asset (books state)
     resting = RestingOrder oid (orderSide order) (limitPrice order) (orderQuantity order)
-    eligible = filter crosses (ownedOrders state)
+    eligible = filter crosses book
     crosses (_, maker) = restingSide maker /= orderSide order
       && case orderSide order of
         Buy -> restingPrice maker <= limitPrice order

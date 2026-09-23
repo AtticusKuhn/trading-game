@@ -7,6 +7,7 @@ import qualified Control.Concurrent.Async as Async
 import Control.Concurrent.MVar
 import Control.Effect (liftIO, run, runIO)
 import Control.Monad (void)
+import qualified Data.Map.Strict as Map
 import Data.List (foldl')
 import Data.Time.Clock (addUTCTime)
 import Test.QuickCheck
@@ -127,4 +128,4 @@ prop_waitsAndSettlement (Positive delay) secret = liveProperty "session waits an
     takeMVar requested
     advance close
     result <- Async.wait caller
-    pure (result === Right (Settlement secret 0 [PlayerResult player 0]))
+    pure (result === Right (Settlement (Map.fromSet (\asset -> resolve asset [secret]) allInstruments) 0 [PlayerResult player 0]))

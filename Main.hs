@@ -5,6 +5,7 @@ module Main where
 
 import Control.Effect (run)
 import Control.Monad (unless)
+import qualified Data.Map.Strict as Map
 import Data.List (foldl')
 import System.Exit (exitFailure)
 import Test.QuickCheck
@@ -31,7 +32,8 @@ prop_settlementsSumToZero = checkCoverage $
          conjoin $ (sum payoffs === 0) :
            [ conjoin
                [ playerResults result === zipWith PlayerResult (map fst programs) payoffs
-               , resolvedSum result === sum (map (privateNumber . settledPlayer) (playerResults result))
+               , resolutions result === Map.fromSet
+                   (\asset -> resolve asset (map (privateNumber . fst) programs)) allInstruments
                ]
            | result <- settlements
            ]
@@ -53,15 +55,16 @@ prop_samePriceLeavesOnlyOneSide =
     forAllShrink (listOf ((\order -> order { limitPrice = price }) <$> genOrder))
       (shrinkList (const [])) $ \orders ->
         let owner = PlayerId 1
-            initial = Exchange 1 [] [] [(owner, (0, 0))]
+            initial = Exchange 1 (Map.fromSet (const []) allInstruments) [] (Map.singleton owner (Account 0 Map.empty))
             submit state (oid, order) =
               matchOrder simulationStart owner oid order state
             final = foldl' submit initial (zip (map OrderId [1..]) orders)
-            book = map snd (ownedOrders final)
-            buys = filter ((== Buy) . restingSide) book
-            sells = filter ((== Sell) . restingSide) book
-        in counterexample ("Remaining book: " ++ show book) $
-             property (null buys || null sells)
+            oneSide entries =
+              let book = map snd entries
+              in null (filter ((== Buy) . restingSide) book)
+                 || null (filter ((== Sell) . restingSide) book)
+        in counterexample ("Remaining books: " ++ show (books final)) $
+             property (all oneSide (Map.elems (books final)))
 
 main :: IO ()
 main = do

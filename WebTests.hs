@@ -18,13 +18,14 @@ import System.Random (randomRIO)
 import Data.Maybe (isJust)
 import LiveTests (liveProperty, manualClock)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import Network.HTTP.Types
 import Network.Wai
 import Network.Wai.Test
 import Test.QuickCheck
-import TestSupport (genOrder, genEngine)
+import TestSupport (genOrder, genEngine, genRoster)
 import Text.Blaze.Html5 (toHtml)
 import Text.Blaze.Html.Renderer.Utf8 (renderHtml)
 import TradingGame
@@ -53,6 +54,7 @@ post path headers fields = SRequest
 orderFields :: LimitOrder -> [(B.ByteString, B.ByteString)]
 orderFields order =
   [("side", if orderSide order == Buy then "buy" else "sell")
+  ,("instrument", B.pack (show (instrument order)))
   ,("price", B.pack (priceText (limitPrice order)))
   ,("quantity", B.pack (show (orderQuantity order)))]
 
@@ -132,7 +134,7 @@ prop_settlementTable = forAll genEngine $ \engine ->
         escaped = T.decodeUtf8 . LBS.toStrict . renderHtml . toHtml
         expected =
           [map escaped [displayName (settledPlayer entry), show (privateNumber (settledPlayer entry)), number (playerPayoff entry)]
-          | entry <- playerResults (settlementFor pid engine)]
+          | entry <- playerResults (settlementFor pid (advanceTo (closesAt (engineInfo engine)) engine))]
     in conjoin
       [ rows (viewAt (closesAt (engineInfo engine))) === expected
       , property (not ("Player results" `B.isInfixOf` LBS.toStrict (viewAt (opensAt (engineInfo engine)))))
@@ -209,4 +211,40 @@ prop_streamClosure = forAll genEngine $ \initial -> forAll (elements (players in
         ]
 
 webProperties :: [Property]
-webProperties = [prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer, prop_streamClosure]
+webProperties = [prop_instrumentViews, prop_disabledHttpOrder, prop_orderForm, prop_requiresSession, prop_boundOrder, prop_joins, property prop_sseFraming, prop_settlementTable, prop_rejoin, prop_unknownPlayer, prop_streamClosure]
+
+-- Only enabled instruments have books and order choices in a full page or SSE.
+prop_instrumentViews :: Property
+prop_instrumentViews = forAll genRoster $ \roster ->
+  forAll (Set.fromList <$> sublistOf [minBound .. maxBound]) $ \enabled ->
+    let engine = newEngineWithInstruments enabled simulationStart 60 roster
+        snapshot = exchangeSnapshot simulationStart engine
+        player = head roster
+        page = LBS.toStrict (renderHtml (gameView "" (BrowserSession player) (privateNumber player) snapshot Nothing))
+        wire = LBS.toStrict (toLazyByteString (sseHtml "exchange" (exchangeView snapshot Nothing)))
+        contains prefix asset bytes = B.pack (prefix ++ show asset ++ "\"") `B.isInfixOf` bytes
+    in conjoin [conjoin
+         [ contains "data-instrument=\"" asset page === Set.member asset enabled
+         , contains "data-instrument=\"" asset wire === Set.member asset enabled
+         , contains "<option value=\"" asset page === Set.member asset enabled ]
+       | asset <- Set.toAscList allInstruments ]
+
+-- Hiding a choice is insufficient: crafted requests must also be rejected.
+prop_disabledHttpOrder :: Property
+prop_disabledHttpOrder = forAll genRoster $ \roster -> forAll genOrder $ \order ->
+  forAll (Set.fromList <$> sublistOf [minBound .. maxBound]) $ \selection ->
+    liveProperty "disabled HTTP instrument" $ do
+      let enabled = Set.delete (instrument order) selection
+          initial = newEngineWithInstruments enabled simulationStart 60 roster
+          player = head roster
+      (clock, _) <- manualClock simulationStart
+      runtime <- newLiveRuntime clock (const (pure ())) initial
+      sessions <- newTVarIO Map.empty
+      let game = WebGame runtime sessions roster []
+      Right token <- joinWebPlayer game (T.pack (displayName player))
+      response <- runSession (srequest (post "/orders" [(hCookie, "trading-session=" <> token)] (orderFields order))) (webApplication game)
+      after <- readMVar (runtimeEngine runtime)
+      pure $ conjoin [after === initial, property ("disabled" `B.isInfixOf` LBS.toStrict (simpleBody response))]
+
+prop_orderForm :: Property
+prop_orderForm = forAll genOrder $ \order -> parseOrderForm (orderFields order) === Right order

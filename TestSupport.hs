@@ -16,11 +16,12 @@ genTradingGame = do
 
 genOrder :: Gen LimitOrder
 genOrder = do
+  asset <- elements [minBound .. maxBound]
   side <- elements [Buy, Sell]
   numerator <- chooseInteger (-20, 20)
   denominator <- chooseInteger (1, 4)
   quantity <- chooseInteger (1, 10)
-  pure (LimitOrder side (Price (numerator % denominator)) quantity)
+  pure (LimitOrder side (Price (numerator % denominator)) asset quantity)
 
 genPlayers :: Gen [PlayerProgram '[]]
 genPlayers = do

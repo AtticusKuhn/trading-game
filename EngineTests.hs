@@ -4,6 +4,10 @@
 
 module EngineTests (engineProperties, discoverLaws) where
 
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
+import Data.List (sort, transpose)
+import Data.Ratio ((%))
 import Data.Proxy (Proxy(..))
 import Data.Time.Clock (addUTCTime)
 import qualified QuickSpec as QS
@@ -18,20 +22,26 @@ engineProperties =
   , prop_invalidOrder
   , prop_waits
   , prop_settlementDisclosure
+  , prop_instrumentIsolation
+  , prop_enabledInstruments
+  , prop_portfolioPayoff
+  , property prop_resolutionTranslation
+  , property prop_populationStdDev
+  , property prop_orderStatistics
   ]
 
 prop_conservation :: Property
 prop_conservation = forAll genEngine $ \engine ->
   let state = engineBook engine
-      balances = map snd (accounts state)
-      book = map snd (ownedOrders state)
-      buys = [restingPrice o | o <- book, restingSide o == Buy]
-      sells = [restingPrice o | o <- book, restingSide o == Sell]
+      balances = Map.elems (accounts state)
+      uncrossed book = and [restingPrice buy < restingPrice sell
+                          | (_, buy) <- book, restingSide buy == Buy
+                          , (_, sell) <- book, restingSide sell == Sell]
   in conjoin
-    [ sum (map fst balances) === 0
-    , sum (map snd balances) === 0
-    , property (all ((> 0) . remainingQuantity) book)
-    , property (and [buy < sell | buy <- buys, sell <- sells])
+    [ property (all (== 0) (Map.elems (Map.unionsWith (+) (map positions balances))))
+    , sum (map cash balances) === 0
+    , property (all ((> 0) . remainingQuantity . snd) (concat (Map.elems (books state))))
+    , property (all uncrossed (Map.elems (books state)))
     ]
 
 prop_closure :: Property
@@ -43,8 +53,8 @@ prop_closure = forAll genEngine $ \engine ->
         (_, snapshot) = handleRequest deadline (PlayerId 1) GetExchangeState engine
     in conjoin
       [ advanceTo later closed === closed
-      , enginePhase closed === Resolved (engineTotal engine)
-      , ownedOrders (engineBook closed) === []
+      , enginePhase closed === Resolved (engineResolutions engine)
+      , books (engineBook closed) === Map.map (const []) (books (engineBook engine))
       , players closed === players engine
       , accounts (engineBook closed) === accounts (engineBook engine)
       , executedTrades (engineBook closed) === executedTrades (engineBook engine)
@@ -55,8 +65,8 @@ prop_closure = forAll genEngine $ \engine ->
       , snapshot === Reply ExchangeState
           { gameInfo = engineInfo engine
           , observedAt = deadline
-          , gamePhase = Resolved (engineTotal engine)
-          , orderBook = []
+          , gamePhase = Resolved (engineResolutions engine)
+          , orderBook = Map.map (const []) (books (engineBook engine))
           , tradeHistory = reverse (executedTrades (engineBook engine))
           }
       ]
@@ -118,3 +128,90 @@ discoverLaws = QS.quickSpec
   , QS.withMaxTermSize 3
   , QS.withMaxTests 100
   ]
+
+-- A submission can affect only its instrument, including fills and positions.
+prop_instrumentIsolation :: Property
+prop_instrumentIsolation = forAll genEngine $ \engine -> forAll genOrder $ \order ->
+  forAll (elements (players engine)) $ \player ->
+    let (updated, _) = handleRequest simulationStart (playerID player) (SubmitOrder order) engine
+        before = engineBook engine
+        after = engineBook updated
+        asset = instrument order
+        newTrades = take (length (executedTrades after) - length (executedTrades before)) (executedTrades after)
+    in conjoin
+      [ Map.delete asset (books after) === Map.delete asset (books before)
+      , Map.map (Map.delete asset . positions) (accounts after)
+          === Map.map (Map.delete asset . positions) (accounts before)
+      , property (all ((== asset) . tradeInstrument) newTrades)
+      ]
+
+-- Disabled requests are inert, including order IDs and public notifications.
+prop_enabledInstruments :: Property
+prop_enabledInstruments = forAll genRoster $ \roster ->
+  forAll (Set.fromList <$> sublistOf [minBound .. maxBound]) $ \enabled ->
+    forAll genOrder $ \order ->
+      let engine = newEngineWithInstruments enabled simulationStart 60 roster
+          (updated, reply) = handleRequest simulationStart (playerID (head roster)) (SubmitOrder order) engine
+          closed = advanceTo (closesAt (engineInfo engine)) updated
+      in conjoin
+        [ Map.keysSet (orderBook (exchangeSnapshot simulationStart updated)) === enabled
+        , Map.keysSet (resolutions (settlementFor (playerID (head roster)) closed)) === enabled
+        , if instrument order `Set.member` enabled then property (case reply of Reply (Right _) -> True; _ -> False)
+          else (updated, reply) === (engine, Reply (Left InstrumentDisabled))
+        ]
+
+-- Trading a portfolio pays the sum of trading each instrument independently.
+prop_portfolioPayoff :: Property
+prop_portfolioPayoff = forAll genRoster $ \roster ->
+  forAll (listOf ((,) <$> elements (map playerID roster) <*> genOrder)) $ \orders ->
+    let settle enabled tape =
+          let initial = newEngineWithInstruments enabled simulationStart 60 roster
+              final = foldl (\engine (pid, order) -> fst (handleRequest simulationStart pid (SubmitOrder order) engine)) initial tape
+          in map netPayoff (engineSettlements (advanceTo (closesAt (engineInfo final)) final))
+        separate = [settle (Set.singleton asset) (filter ((== asset) . instrument . snd) orders)
+                   | asset <- Set.toAscList allInstruments]
+    in settle allInstruments orders === map sum (transpose separate)
+
+-- Resolution is insensitive to player order; translating every secret shifts
+-- location statistics but leaves range and standard deviation unchanged.
+prop_resolutionTranslation :: NonEmptyList Integer -> Integer -> Property
+prop_resolutionTranslation (NonEmpty values) offset =
+  forAll (shuffle values) $ \permuted -> conjoin
+    [ conjoin [resolve asset permuted === resolve asset values,
+               resolve asset (map (+ offset) values) === resolve asset values + shift asset]
+    | asset <- Set.toAscList allInstruments ]
+  where
+    shift Sum = fromInteger (toInteger (length values) * offset)
+    shift Range = 0
+    shift StdDev = 0
+    shift _ = fromInteger offset
+
+-- Pairwise squared distances characterize population variance without a mean.
+-- The rounded result must lie within half a millionth of its square root.
+prop_populationStdDev :: NonEmptyList Integer -> Property
+prop_populationStdDev (NonEmpty values) =
+  let count = toInteger (length values)
+      variance = sum [(x - y) ^ (2 :: Int) | x <- values, y <- values] % (2 * count * count)
+      result = resolve StdDev values
+      halfUnit = 1 % 2000000
+  in conjoin
+    [ property (result >= 0)
+    , property (max 0 (result - halfUnit) ^ (2 :: Int) <= variance)
+    , property (variance <= (result + halfUnit) ^ (2 :: Int))
+    ]
+
+prop_orderStatistics :: NonEmptyList Integer -> Property
+prop_orderStatistics (NonEmpty values) =
+  let low = resolve Min values
+      high = resolve Max values
+      middle = resolve Median values
+      ordered = sort values
+      middleValues = take (if odd (length values) then 1 else 2)
+        (drop ((length values - 1) `div` 2) ordered)
+  in conjoin
+    [ low === fromInteger (head ordered)
+    , high === fromInteger (last ordered)
+    , resolve Range values === high - low
+    , middle === sum middleValues % toInteger (length middleValues)
+    , resolve Sum values === fromInteger (sum values)
+    ]

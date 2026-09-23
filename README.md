@@ -1,8 +1,17 @@
 # Trading Game
 
 Players use the same `Eff (TradingGame ': Concurrent ': effs) ()` programs in virtual and real
-time. Each player knows their own private number and trades contracts on the sum
-of all private numbers. The default game lasts one hour.
+time. Each player knows their own private number and trades contracts on statistics
+of all private numbers: `Sum`, `Range`, `Min`, `Max`, `Median`, and `StdDev`.
+The default game lasts one hour. Each instrument has an independent order book;
+orders in different instruments never match. Accounts share cash but track a
+separate integer position in each instrument. Final payoff is
+`cash + sum (position[instrument] * resolution[instrument])`.
+
+Median averages the two middle values for an even roster. `StdDev` is population
+standard deviation, rounded to the nearest six decimal places (ties up). All
+other resolutions are exact rationals, and standard deviation is calculated
+using exact arithmetic before rounding.
 
 ```haskell
 {-# LANGUAGE DataKinds #-}
@@ -13,8 +22,8 @@ import TradingGame
 
 programs :: [PlayerProgram effs]
 programs =
-  [ (Player (PlayerId 42) "alice" 3, void (submitOrder (LimitOrder Buy  (Price 5) 2)))
-  , (Player (PlayerId (-7)) "bob" 7, void (submitOrder (LimitOrder Sell (Price 5) 2)))
+  [ (Player (PlayerId 42) "alice" 3, void (submitOrder (LimitOrder Buy  (Price 5) Sum 2)))
+  , (Player (PlayerId (-7)) "bob" 7, void (submitOrder (LimitOrder Sell (Price 5) Sum 2)))
   ]
 
 -- Pure; advances virtual time directly to the next event.
@@ -46,7 +55,10 @@ Open `http://127.0.0.1:3000` to see all games, including upcoming and completed
 games, and create a game. Choose start/end times **in UTC**, player names, and
 human, random trading bot, or market-making bot for each roster entry. Blank
 rows are ignored; add more rows with the button. Names must be nonblank and
-unique within a game, and the end must be after the start. All-bot games are
+unique within a game, and the end must be after the start. Instrument checkboxes
+default to all enabled; disabled instruments have no book or order choice, and
+the server rejects orders for them. Selecting none is allowed. The selection
+is fixed for the game, like its roster. All-bot games are
 allowed. Games and browser sessions are stored in memory and reset on restart.
 
 The server draws each player's private number uniformly from 1 through 9 at
@@ -71,9 +83,10 @@ and scheduled starts. Streams send a full snapshot on reconnect and keep-alive
 comments every fifteen seconds. There is no client polling or custom JavaScript.
 HTMX, its SSE extension, and Tailwind load from pinned CDN URLs.
 
-The market maker estimates the sum using its secret and the configured roster
-size, then replenishes both sides of the book. The random trading bot draws
-sides, prices, and quantities from a server-generated seed. Both use the shared
+The market maker estimates each enabled instrument using its secret and the mean
+of the private-number distribution for unknown players, then replenishes both
+sides of each book. The random trading bot draws enabled instruments, sides,
+prices, and quantities from a server-generated seed. Both use the shared
 trading effects; seeded bots also work in deterministic simulations. Workers
 start when the game opens and are cancelled at its original end time.
 
@@ -91,6 +104,7 @@ data NewGameConfig = NewGameConfig
   { gameStart :: UTCTime
   , gameEnd :: UTCTime
   , gameRoster :: [RosterEntry]
+  , gameInstruments :: Set Instrument
   }
 
 data RosterEntry = RosterEntry
@@ -100,6 +114,14 @@ data RosterEntry = RosterEntry
 
 data PlayerType = HumanPlayer | RandomTradingBot | MarketMakingBot
 ```
+
+`defaultNewGameConfig start end roster` enables all instruments. Override
+`gameInstruments` with a `Set Instrument` to choose a subset. Standalone engines
+use `newEngineWithInstruments`; simulations accept the same set through
+`runTradingGameWithInstruments enabled start duration programs`, and live
+runners through `defaultLiveConfig { liveInstruments = enabled }`. Existing
+entrypoints default to `allInstruments`. `GameInfo.enabledInstruments` exposes
+the fixed selection, and `Settlement.resolutions` contains its final values.
 
 `withGameManager clock` scopes the in-memory directory and all game workers;
 `runManageGames manager` interprets the effect. Summaries expose only IDs,
@@ -143,8 +165,9 @@ Commands:
 join alice
 private
 book
-buy 11 2
-sell 9 1
+buy Sum 11 2
+sell Sum 9 1
+buy Range 4 1
 wait 5
 settlement
 help
@@ -156,7 +179,9 @@ quit
 Prices and seconds accept integers, exact decimals, and fractions such as `3/2`.
 Quantities must be positive integers. Invalid input prints an error and retries;
 EOF acts as `quit`. `logout` returns to the session prompt; `quit` exits the
-terminal. `settlement` waits for closure and prints the resolved sum, your payoff,
+terminal. Orders use `buy INSTRUMENT PRICE QUANTITY` or `sell INSTRUMENT PRICE QUANTITY`;
+omitting the instrument defaults to `Sum`. `settlement` waits for closure and
+prints each enabled instrument’s resolution, your payoff,
 and every player's private number and payoff.
 The live exchange closes at its deadline even while the terminal is waiting for
 input; the terminal remains available to inspect the resolved game until quit.

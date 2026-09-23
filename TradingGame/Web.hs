@@ -20,6 +20,7 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.Char (isSpace)
 import Data.List (find, sortOn)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Ratio (denominator, numerator)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -105,10 +106,10 @@ joinWebPlayer game name = case find ((== T.unpack name) . displayName) (humanPla
 -- Each field must be a single token, so extra commands cannot be smuggled in.
 parseOrderForm :: [(BS.ByteString, BS.ByteString)] -> Either String LimitOrder
 parseOrderForm fields = do
-  values <- traverse field ["side", "price", "quantity"]
+  values <- traverse field ["side", "instrument", "price", "quantity"]
   case parseCommand (unwords values) of
     Right (PlaceOrder order) -> Right order
-    _ -> Left "Choose buy or sell, a numeric price, and a positive integer quantity."
+    _ -> Left "Choose buy or sell, an instrument, a numeric price, and a positive integer quantity."
   where
     field key = case lookup key fields of
       Just value | not (B.null value) && B.length value <= 100 && not (B.any isSpace value) -> Right (B.unpack value)
@@ -171,6 +172,7 @@ gameApplication base game request respond = do
               Right (OrderId oid) -> "Order #" ++ show oid ++ " accepted. Unfilled quantity remains open."
               Left GameClosed -> "The game has settled; orders are closed."
               Left InvalidQuantity -> "Quantity must be a positive integer."
+              Left InstrumentDisabled -> "This instrument is disabled for this game."
     ("GET", ["events"]) -> case session of
       Nothing -> respond (htmlResponse status401 [] (H.p "Join as a player first."))
       Just current -> respond (eventStream game current)
@@ -251,7 +253,7 @@ document content = H.docTypeHtml ! A.lang "en" $ do
     H.header $ do
       H.p ! A.class_ "text-sm font-semibold uppercase tracking-widest text-indigo-600" $ "Local debugging exchange"
       H.h1 ! A.class_ "text-3xl font-bold" $ "Trading Game"
-      H.p ! A.class_ "mt-2 text-slate-600" $ "Trade contracts on the sum of the players’ private numbers. Each number is between 1 and 9."
+      H.p ! A.class_ "mt-2 text-slate-600" $ "Trade contracts on statistics of the players’ private numbers. Each number is between 1 and 9."
       H.a ! A.href "/" ! A.class_ "text-indigo-700 underline" $ "All games"
     content
     H.footer ! A.class_ "text-sm text-slate-500" $ "In-memory demo · Restart the server to reset."
@@ -261,7 +263,7 @@ joinView _ [] _ = panel (H.p "This roster contains only bots; there are no human
 joinView base roster problem = panel $ do
   H.h2 ! A.class_ "text-xl font-semibold" $ "Join as a player"
   H.p "Choose an existing player. Rejoining from any browser returns to the same private number, orders, and account."
-  H.p ! A.class_ "text-sm text-slate-600" $ "The roster and private numbers were fixed when this game was created. Every player counts toward the sum, even before joining."
+  H.p ! A.class_ "text-sm text-slate-600" $ "The roster and private numbers were fixed when this game was created. Every player counts toward the resolutions, even before joining."
   forM_ problem $ \message -> H.p ! A.role "alert" ! A.class_ "text-red-700" $ toHtml message
   H.form ! A.method "post" ! A.action (H.toValue (base <> "/join")) ! A.class_ "max-w-sm space-y-3" $ do
     H.label ! A.for "name" ! A.class_ "block" $ "Player name"
@@ -276,10 +278,15 @@ gameView base session secret snapshot settlement = do
     H.p $ do
       "Your private number: "
       H.strong ! A.class_ "font-mono text-2xl text-indigo-700" $ toHtml (show secret)
-  panel $ do
+  if Set.null (enabledInstruments (gameInfo snapshot)) then panel (H.p "No instruments are enabled for this game.") else panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ "New limit order"
     H.form ! A.method "post" ! A.action (H.toValue (base <> "/orders")) ! attr "hx-post" (H.toValue (base <> "/orders")) ! attr "hx-target" "#order-result"
-      ! attr "hx-disabled-elt" "find button" ! A.class_ "grid gap-4 sm:grid-cols-4 sm:items-end" $ do
+      ! attr "hx-disabled-elt" "find button" ! A.class_ "grid gap-4 sm:grid-cols-5 sm:items-end" $ do
+      H.label $ do
+        "Instrument"
+        H.select ! A.name "instrument" ! A.class_ inputClass $
+          forM_ (Set.toAscList (enabledInstruments (gameInfo snapshot))) $ \asset ->
+            H.option ! A.value (H.toValue (show asset)) $ toHtml (show asset)
       H.label $ do
         "Side"
         H.select ! A.name "side" ! A.class_ inputClass $ do
@@ -302,7 +309,11 @@ exchangeView snapshot settlement = do
   panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ case gamePhase snapshot of
       Trading -> "Exchange open"
-      Resolved total -> toHtml ("Settled · sum = " ++ show total)
+      Resolved _ -> "Settled"
+    case gamePhase snapshot of
+      Trading -> mempty
+      Resolved values -> forM_ (Map.toAscList values) $ \(asset, value) ->
+        H.p $ toHtml (show asset ++ " = " ++ number value)
     H.p ! A.class_ "text-sm text-slate-600" $ toHtml ("Closes: " ++ show (closesAt (gameInfo snapshot)))
     H.p ! A.class_ "text-sm text-slate-600" $ toHtml ("Last server update: " ++ show (observedAt snapshot))
     forM_ settlement $ \result -> H.p ! A.class_ "font-semibold" $ toHtml ("Your payoff: " ++ number (netPayoff result))
@@ -313,22 +324,26 @@ exchangeView snapshot settlement = do
         cell (displayName (settledPlayer entry))
         cell (show (privateNumber (settledPlayer entry)))
         cell (number (playerPayoff entry))
-  H.div ! A.class_ "grid gap-6 md:grid-cols-2" $ do
-    bookPanel Buy "Open buys · highest first"
-    bookPanel Sell "Open sells · lowest first"
+  forM_ (Map.toAscList (orderBook snapshot)) $ \(asset, book) ->
+    H.section ! attr "data-instrument" (H.toValue (show asset)) ! A.class_ "space-y-4" $ do
+      H.h2 ! A.class_ "text-xl font-semibold" $ toHtml (show asset)
+      H.div ! A.class_ "grid gap-6 md:grid-cols-2" $ do
+        bookPanel book Buy "Open buys · highest first"
+        bookPanel book Sell "Open sells · lowest first"
   panel $ do
     H.h2 ! A.class_ "text-xl font-semibold" $ "Recent trades"
     if null (tradeHistory snapshot) then H.p "No trades yet."
-    else table ["Time (UTC)", "Price", "Quantity"] $
+    else table ["Time (UTC)", "Instrument", "Price", "Quantity"] $
       forM_ (take 20 (reverse (tradeHistory snapshot))) $ \trade -> H.tr $ do
         cell (show (tradedAt trade))
+        cell (show (tradeInstrument trade))
         cell (priceText (tradePrice trade))
         cell (show (tradeQuantity trade))
   where
-    bookPanel side title = panel $ do
+    bookPanel book side title = panel $ do
       H.h2 ! A.class_ (if side == Buy then "text-lg font-semibold text-emerald-700" else "text-lg font-semibold text-rose-700") $ title
       let entries = sortOn (\entry -> (if side == Buy then negatePrice (restingPrice entry) else restingPrice entry, restingOrderId entry))
-            (filter ((== side) . restingSide) (orderBook snapshot))
+            (filter ((== side) . restingSide) book)
       if null entries then H.p "No open orders."
       else table ["Order", "Price", "Remaining"] $ forM_ entries $ \entry -> H.tr $ do
         let OrderId oid = restingOrderId entry
@@ -512,12 +527,18 @@ parseNewGameForm :: [(BS.ByteString, BS.ByteString)] -> Either String NewGameCon
 parseNewGameForm fields = do
   start <- timestamp "start"
   end <- timestamp "end"
+  selected <- if lookup "instruments-present" fields == Nothing && not (any ((== "instrument") . fst) fields)
+    then pure allInstruments
+    else Set.fromList <$> traverse parseInstrument [value | (key, value) <- fields, key == "instrument"]
   names <- traverse decode [value | (key, value) <- fields, key == "player-name"]
   types <- traverse parseType [value | (key, value) <- fields, key == "player-type"]
   if length names /= length types then Left "Every roster row needs a name and player type."
   else pure (NewGameConfig start end [RosterEntry (T.unpack name) kind
-        | (name, kind) <- zip names types, not (T.null name)])
+        | (name, kind) <- zip names types, not (T.null name)] selected)
   where
+    parseInstrument value = case readMaybe (B.unpack value) of
+      Just asset -> Right asset
+      Nothing -> Left "Choose a supported instrument."
     decode value = either (const (Left "Use valid UTF-8 player names.")) Right (T.decodeUtf8' value)
     timestamp key = case lookup key fields >>= parseTimestamp . B.unpack of
       Nothing -> Left "Enter start and end times in UTC."
@@ -542,6 +563,16 @@ creationView duration fields problem = panel $ do
       H.input ! A.type_ "datetime-local" ! A.name (H.toValue (B.unpack key)) ! A.required "" ! A.step "1"
         ! A.value (H.toValue (B.unpack (maybe "" id (lookup key fields)))) ! A.class_ inputClass
     H.p ! A.class_ "text-sm text-slate-600" $ toHtml ("Suggested duration: " ++ show duration ++ ". All times are UTC.")
+    H.fieldset ! A.class_ "space-y-2" $ do
+      H.legend ! A.class_ "font-semibold" $ "Enabled instruments"
+      H.input ! A.type_ "hidden" ! A.name "instruments-present" ! A.value "yes"
+      forM_ (Set.toAscList allInstruments) $ \asset -> H.label ! A.class_ "mr-4 inline-flex items-center gap-2" $ do
+        let selected = lookup "instruments-present" fields == Nothing
+              || ("instrument", B.pack (show asset)) `elem` fields
+        (if selected then (! A.checked "") else id) $
+          H.input ! A.type_ "checkbox" ! A.name "instrument" ! A.value (H.toValue (show asset))
+        toHtml (show asset)
+      H.p ! A.class_ "text-sm text-slate-600" $ "Each instrument has its own order book. StdDev uses population standard deviation, rounded to six decimal places."
     H.div ! A.id "roster" ! A.class_ "space-y-3" $ do
       H.p "Players (leave unused rows blank)"
       let names = [value | (key, value) <- fields, key == "player-name"]

@@ -10,6 +10,8 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Effect (runIO)
 import Control.Monad (foldM, unless, void)
+import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Ratio ((%))
 import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime)
 import GHC.Conc (ThreadStatus(..), BlockReason(..), threadStatus)
@@ -54,16 +56,16 @@ scenarioEngine scenario =
        [testPlayer first firstSecret, testPlayer second secondSecret]
 
 -- Generate valid orders, including negative/fractional prices, with shrinking.
-newtype ValidOrder = ValidOrder (Bool, Integer, Positive Integer, Positive Integer)
+data ValidOrder = ValidOrder Instrument (Bool, Integer, Positive Integer, Positive Integer)
   deriving Show
 
 instance Arbitrary ValidOrder where
-  arbitrary = ValidOrder <$> arbitrary
-  shrink (ValidOrder values) = map ValidOrder (shrink values)
+  arbitrary = ValidOrder <$> elements [minBound .. maxBound] <*> arbitrary
+  shrink (ValidOrder asset values) = map (ValidOrder asset) (shrink values)
 
 validOrder :: ValidOrder -> LimitOrder
-validOrder (ValidOrder (buy, numerator, Positive denominator, Positive quantity)) =
-  LimitOrder (if buy then Buy else Sell) (Price (numerator % denominator)) quantity
+validOrder (ValidOrder asset (buy, numerator, Positive denominator, Positive quantity)) =
+  LimitOrder (if buy then Buy else Sell) (Price (numerator % denominator)) asset quantity
 
 -- No real sleeps: advancing one TVar changes both clock reads and all alarms.
 manualClock :: UTCTime -> IO (LiveClock, UTCTime -> IO ())
@@ -180,8 +182,8 @@ prop_concurrentPlayers scenario generated = liveProperty "concurrent programs, w
       order = validOrder generated
       Price price = limitPrice order
       quantity = orderQuantity order
-      total = toInteger buyerSecret + toInteger sellerSecret
-      payoff = fromInteger quantity * (fromInteger total - price)
+      total = resolve (instrument order) [toInteger buyerSecret, toInteger sellerSecret]
+      payoff = fromInteger quantity * (total - price)
   (clock, advance) <- manualClock start
   events <- newTVarIO []
   let buyer = do
@@ -190,7 +192,7 @@ prop_concurrentPlayers scenario generated = liveProperty "concurrent programs, w
         void (submitOrder order { orderSide = Buy })
         wait buyerWake
         snapshot <- getExchangeState
-        unless (tradeHistory snapshot == [Trade (limitPrice order) quantity (addUTCTime sellerWake start)]) $
+        unless (tradeHistory snapshot == [Trade (instrument order) (limitPrice order) quantity (addUTCTime sellerWake start)]) $
           error "sleeping buyer did not observe seller's fill"
         void awaitSettlement
       seller = do
@@ -214,28 +216,29 @@ prop_concurrentPlayers scenario generated = liveProperty "concurrent programs, w
     trace <- reverse <$> readTVarIO events
     pure $ conjoin
       [ engineSettlements final ===
-          [Settlement total (-payoff) results, Settlement total payoff results]
+          [Settlement (engineResolutions initial) (-payoff) results, Settlement (engineResolutions initial) payoff results]
       , counterexample "concurrent trace replay" (replay initial trace === Right final)
       , counterexample "one closure event" (length [() | ExchangeClosed _ <- trace] === 1)
       ]
 
 prop_stopsAtClosure :: Scenario -> Positive Integer -> Property
-prop_stopsAtClosure scenario (Positive overrun) = liveProperty "idle closure and cancellation of long waits" $ do
+prop_stopsAtClosure scenario (Positive overrun) =
+  forAll (Set.fromList <$> sublistOf [minBound .. maxBound]) $ \enabled -> liveProperty "idle closure and cancellation of long waits" $ do
   let ((first, firstSecret), (second, secondSecret)) = scenarioPlayers scenario
       start = scenarioStart scenario
       (_, _, duration) = scenarioTimes scenario
-      total = toInteger firstSecret + toInteger secondSecret
+      values = Map.fromSet (\asset -> resolve asset [toInteger firstSecret, toInteger secondSecret]) enabled
       results = [PlayerResult (testPlayer first firstSecret) 0,
                  PlayerResult (testPlayer second secondSecret) 0]
   (clock, advance) <- manualClock start
   events <- newTVarIO []
   let sleeper = wait (duration + fromInteger overrun) >> error "live runner resumed a wait beyond closure"
-      config = defaultLiveConfig { liveDuration = duration, onLiveEvent = record events }
+      config = defaultLiveConfig { liveDuration = duration, liveInstruments = enabled, onLiveEvent = record events }
   Async.withAsync (runIO (runConcurrent (runLiveWith clock config [(testPlayer first firstSecret, sleeper), (testPlayer second secondSecret, pure ())]))) $ \game -> do
     awaitTrace events (hasWait first)
     advance (addUTCTime duration start)
     final <- Async.wait game
-    pure (final === [Settlement total 0 results, Settlement total 0 results])
+    pure (final === [Settlement values 0 results, Settlement values 0 results])
 
 -- All submissions compete for the same engine; no fills or updates may be lost.
 prop_concurrentOrders :: Scenario -> ValidOrder -> Positive Int -> Property
@@ -256,7 +259,8 @@ prop_concurrentOrders scenario generated (Positive count) = liveProperty "concur
   pure $ conjoin
     [ counterexample "all orders accepted" (property (all accepted replies))
     , length (executedTrades (engineBook final)) === count
-    , accounts (engineBook final) === [(buyer, (volume, -fromInteger volume * price)), (seller, (-volume, fromInteger volume * price))]
+    , accounts (engineBook final) === Map.fromList [(buyer, Account (-fromInteger volume * price) (Map.singleton (instrument order) volume)),
+        (seller, Account (fromInteger volume * price) (Map.singleton (instrument order) (-volume)))]
     , nextOrderId (engineBook final) === nextOrderId (engineBook initial) + 2 * toInteger count
     , counterexample "serialized trace" (replay initial trace === Right final)
     ]
@@ -271,8 +275,8 @@ prop_settlementBroadcast scenario generated = liveProperty "shared settlement no
       ((buyer, buyerSecret), (seller, sellerSecret)) = scenarioPlayers scenario
       order = validOrder generated
       Price price = limitPrice order
-      total = engineTotal initial
-      payoff = fromInteger (orderQuantity order) * (fromInteger total - price)
+      total = resolve (instrument order) (map privateNumber (players initial))
+      payoff = fromInteger (orderQuantity order) * (total - price)
   (clock, advance) <- manualClock (scenarioStart scenario)
   events <- newTVarIO []
   runtime <- newLiveRuntime clock (record events) initial
@@ -282,7 +286,7 @@ prop_settlementBroadcast scenario generated = liveProperty "shared settlement no
       player pid side secret expected = (testPlayer pid secret, do
         void (submitOrder order { orderSide = side })
         result <- awaitSettlement
-        unless (result == Settlement total expected results) (error "wrong shared settlement"))
+        unless (result == Settlement (engineResolutions initial) expected results) (error "wrong shared settlement"))
       programs = [player buyer Buy buyerSecret payoff, player seller Sell sellerSecret (-payoff)]
   Async.withAsync (Async.mapConcurrently_ (runIO . runLivePlayer runtime) programs) $ \workers -> do
     awaitTrace events (\trace -> all (`hasSettlementWait` trace) [buyer, seller])
@@ -363,7 +367,7 @@ prop_realClock = forAllShrink arbitrary shrink $ \(identifier, secret) ->
     liveProperty "real clock settlement" $ do
       result <- runIO $ runConcurrent $ runLiveFor (fromRational (micros % 1000000))
         [(testPlayer (PlayerId identifier) secret, void awaitSettlement)]
-      pure (result === [Settlement (toInteger secret) 0 [PlayerResult (testPlayer (PlayerId identifier) secret) 0]])
+      pure (result === [Settlement (Map.fromSet (\asset -> resolve asset [toInteger secret]) allInstruments) 0 [PlayerResult (testPlayer (PlayerId identifier) secret) 0]])
 
 -- All subscribers wake on orders or closure, even if the change lands between
 -- the request decision and entering STM. Every listener gets one consistent view.

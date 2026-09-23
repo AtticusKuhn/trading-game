@@ -28,7 +28,7 @@ main = do
     _ -> die usage
   let initial start = foldl (\engine order -> fst (handleRequest start (PlayerId 2) (SubmitOrder order) engine))
         (newEngine start duration roster)
-        [LimitOrder Buy (Price 9) 10, LimitOrder Sell (Price 11) 10]
+        [LimitOrder Buy (Price 9) Sum 10, LimitOrder Sell (Price 11) Sum 10]
   putStrLn $ "Trading game terminal (" ++ mode ++ ", " ++ show duration ++ ")."
   putStrLn "Players: alice, market-maker. Start with: join alice"
   putStrLn commandHelp
